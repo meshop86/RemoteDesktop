@@ -2451,6 +2451,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wgpu",
+ "windows",
 ]
 
 [[package]]

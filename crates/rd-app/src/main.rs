@@ -17,6 +17,15 @@
 //!                [--bitrate KBPS] [--downloads THƯ_MỤC]
 //! ```
 
+// Trên Windows, bản phát hành không được là chương trình console: bấm vào biểu
+// tượng mà hiện thêm một cửa sổ đen sau lưng giao diện thì trông như lỗi. Đổi
+// sang subsystem "windows" và tự nối lại console của terminal gọi nó (xem
+// `attach_parent_console`) để chạy bằng dòng lệnh vẫn đọc được `--help` và log.
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod app;
 mod net;
 mod session;
@@ -26,7 +35,61 @@ use std::sync::Arc;
 
 use eframe::egui;
 
+/// Nối tiến trình vào console của tiến trình gọi nó, nếu có.
+///
+/// Bản Windows dựng ở subsystem "windows" nên khởi động không kèm console. Chạy
+/// từ terminal thì hàm này mượn lại console của terminal đó để `--help` và log
+/// vẫn hiện ra; bấm từ Explorer thì không có console nào để mượn, `AttachConsole`
+/// trả về lỗi và ta đi tiếp như thường.
+///
+/// Nối xong vẫn phải mở `CONOUT$`/`CONIN$` rồi gán làm handle chuẩn: handle mà
+/// tiến trình nhận lúc khởi động không tự trỏ sang console vừa nối.
+#[cfg(target_os = "windows")]
+fn attach_parent_console() {
+    use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{
+        AttachConsole, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE,
+    };
+    use windows::core::w;
+
+    // SAFETY: chỉ gắn vào console sẵn có của tiến trình cha. Thất bại (không có
+    // cha, hoặc đã có console rồi) chỉ là một mã lỗi, không phải trạng thái hỏng.
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_err() {
+        return;
+    }
+
+    for (name, slot, access) in [
+        (w!("CONOUT$"), STD_OUTPUT_HANDLE, GENERIC_WRITE),
+        (w!("CONOUT$"), STD_ERROR_HANDLE, GENERIC_WRITE),
+        (w!("CONIN$"), STD_INPUT_HANDLE, GENERIC_READ),
+    ] {
+        // SAFETY: mở thiết bị console vừa nối rồi gán vào đúng ô handle chuẩn.
+        // Handle này sống tới khi tiến trình kết thúc nên không đóng ở đây.
+        unsafe {
+            let Ok(handle) = CreateFileW(
+                name,
+                access.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            ) else {
+                continue;
+            };
+            let _ = SetStdHandle(slot, handle);
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    #[cfg(target_os = "windows")]
+    attach_parent_console();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

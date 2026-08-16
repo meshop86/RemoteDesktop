@@ -33,3 +33,7 @@ tracing-subscriber = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 wgpu = { workspace = true }
+
+# Chỉ dùng cho việc nối lại console ở `main.rs`; xem chú thích tại đó.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console"] }

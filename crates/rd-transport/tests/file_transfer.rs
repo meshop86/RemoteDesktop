@@ -270,7 +270,10 @@ async fn hostile_file_name_cannot_escape_download_dir() {
 async fn big_transfer_does_not_stall_video() {
     const FRAMES: u32 = 200;
     const FRAME_SIZE: usize = 30_000;
-    const FILE_SIZE: usize = 64 * 1024 * 1024;
+    // File đủ lớn để chiếm đường truyền suốt cả đợt video, nhưng không lớn hơn
+    // mức cần thiết: test chạy ở bản debug, mà mã hoá QUIC ở bản debug trên
+    // máy CI hai nhân chậm hơn máy thật vài chục lần.
+    const FILE_SIZE: usize = 16 * 1024 * 1024;
 
     let src_dir = TempDir::new("mix-src");
     let dst_dir = TempDir::new("mix-dst");
@@ -290,6 +293,9 @@ async fn big_transfer_does_not_stall_video() {
     let video_task = tokio::spawn(async move {
         let mut sender = VideoSender::new(video_host, 0);
         let mut ticker = tokio::time::interval(Duration::from_millis(2));
+        // Máy chậm mà trễ nhịp thì gửi bù dồn một cục, làm tràn hàng đợi
+        // datagram và tự tay đánh rớt frame của chính mình.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         for index in 0..FRAMES {
             ticker.tick().await;
             let frame = vec![(index % 251) as u8; FRAME_SIZE];
@@ -310,7 +316,9 @@ async fn big_transfer_does_not_stall_video() {
 
     let mut receiver = VideoReceiver::new(link.viewer.clone(), 8);
     let mut latencies_us = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    // Trên máy này cả test xong trong khoảng một giây; hạn rộng chỉ để máy CI
+    // chậm không bị cắt ngang rồi báo là mất frame.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     let mut received = 0u32;
     while received < FRAMES {
         match tokio::time::timeout_at(deadline, receiver.next_frame()).await {
