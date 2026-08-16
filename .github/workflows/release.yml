@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Phiên bản để đặt tên file (ví dụ 0.1.0)"
+        required: true
+        default: "0.1.0"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cài Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Lấy số phiên bản
+        id: version
+        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        env:
+          GITHUB_REF_NAME: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
+
+      # Bản universal: một file chạy được cả trên máy Apple Silicon lẫn Intel.
+      - name: Đóng gói
+        run: |
+          chmod +x packaging/macos/bundle.sh
+          packaging/macos/bundle.sh "${{ steps.version.outputs.value }}" \
+            aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*.dmg
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cài Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Lấy số phiên bản
+        id: version
+        shell: bash
+        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        env:
+          GITHUB_REF_NAME: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
+
+      - name: Build
+        run: cargo build --release -p rd-app -p rd-signal
+
+      - name: Gom file
+        shell: bash
+        run: |
+          mkdir -p dist/windows
+          cp target/release/remote-desktop.exe dist/windows/
+          cp target/release/rd-rendezvous.exe dist/windows/
+          cd dist/windows
+          7z a "../RemoteDesktop-${{ steps.version.outputs.value }}-windows.zip" .
+
+      - name: Dựng bộ cài
+        run: |
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            "/DVersion=${{ steps.version.outputs.value }}" `
+            "/DSourceDir=$PWD\dist\windows" `
+            "/O$PWD\dist" `
+            packaging\windows\installer.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/*.zip
+            dist/*.exe
+
+  release:
+    # Chỉ phát hành khi có tag. Chạy tay (`workflow_dispatch`) thì dừng ở
+    # artifact để tải về thử, không tạo bản phát hành nửa vời.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Tạo bản phát hành
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/macos/* dist/windows/*

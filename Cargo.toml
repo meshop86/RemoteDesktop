@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["Luong Xuan Hoa <luongxuanhoa3011@gmail.com>"]
+
+[workspace.dependencies]
+rd-protocol = { path = "crates/rd-protocol" }
+rd-transport = { path = "crates/rd-transport" }
+rd-capture = { path = "crates/rd-capture" }
+rd-codec = { path = "crates/rd-codec" }
+rd-input = { path = "crates/rd-input" }
+rd-signal = { path = "crates/rd-signal" }
+rd-session = { path = "crates/rd-session" }
+rd-viewer = { path = "crates/rd-viewer" }
+
+anyhow = "1"
+thiserror = "2"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+rand = "0.9"
+blake3 = "1"
+
+# Giao diện. Ba crate này phải cùng bản ở mọi nơi: rd-app đưa `wgpu::Device` của
+# eframe sang cho bộ dựng hình trong rd-viewer, lệch bản là hai kiểu khác nhau.
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts"] }
+egui = "0.36"
+wgpu = "30"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# Profile riêng cho lúc dev: vẫn tối ưu phần nóng (capture/encode) để đo latency thật,
+# nhưng build nhanh hơn release đầy đủ.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

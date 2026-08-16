@@ -1,0 +1,63 @@
+[package]
+name = "rd-codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rd-protocol = { path = "../rd-protocol" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-video-toolbox = { version = "0.3", features = [
+    "VTBase",
+    "VTErrors",
+    "VTSession",
+    "VTCompressionSession",
+    "VTCompressionProperties",
+    "VTDecompressionSession",
+    "VTDecompressionProperties",
+    "objc2-core-media",
+    "objc2-core-video",
+] }
+objc2-core-media = { version = "0.3", features = [
+    "CMBase",
+    "CMTime",
+    "CMSampleBuffer",
+    "CMBlockBuffer",
+    "CMFormatDescription",
+    "objc2-core-video",
+] }
+objc2-core-video = { version = "0.3", features = [
+    "CVPixelBuffer",
+    "CVPixelBufferIOSurface",
+    "CVImageBuffer",
+    "CVBuffer",
+    "CVReturn",
+] }
+objc2-core-foundation = { version = "0.3", features = [
+    "CFBase",
+    "CFArray",
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
+
+[dev-dependencies]
+rd-capture = { path = "../rd-capture" }
+tracing-subscriber = { workspace = true }

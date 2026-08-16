@@ -1,0 +1,27 @@
+[package]
+name = "rd-signal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rd-protocol = { workspace = true }
+rd-transport = { workspace = true }
+serde = { workspace = true }
+# "signal" để binary bắt Ctrl-C và đóng kết nối tử tế.
+tokio = { workspace = true, features = ["signal"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+parking_lot = { workspace = true }
+# Chỉ binary rd-rendezvous dùng hai thứ này.
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[[bin]]
+name = "rd-rendezvous"
+path = "src/bin/rendezvous.rs"

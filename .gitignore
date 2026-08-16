@@ -1,0 +1,11 @@
+# Sản phẩm build
+/target
+/dist
+
+# macOS
+.DS_Store
+
+# Trình soạn thảo
+.idea/
+.vscode/
+*.swp

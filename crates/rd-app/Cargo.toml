@@ -1,0 +1,35 @@
+[package]
+name = "rd-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Điều khiển máy tính từ xa: màn hình, chuột phím, chat, truyền file"
+
+# Crate này gom mọi thứ lại thành một chương trình chạy được. Nó là crate *duy
+# nhất* phụ thuộc cả rd-transport lẫn rd-viewer — nhờ vậy rd-viewer vẫn kiểm tra
+# chéo được sang Windows từ máy macOS (rd-transport kéo theo `ring`, mà `ring`
+# cần SDK của MSVC mới build được).
+[[bin]]
+name = "remote-desktop"
+path = "src/main.rs"
+
+[dependencies]
+rd-protocol = { workspace = true }
+rd-transport = { workspace = true }
+rd-capture = { workspace = true }
+rd-codec = { workspace = true }
+rd-input = { workspace = true }
+rd-signal = { workspace = true }
+rd-session = { workspace = true }
+rd-viewer = { workspace = true }
+anyhow = { workspace = true }
+blake3 = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+wgpu = { workspace = true }

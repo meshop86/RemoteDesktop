@@ -1,0 +1,596 @@
+//! Màn hình đầu và bộ máy trạng thái của cả chương trình.
+
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Instant;
+
+use eframe::egui;
+
+#[cfg(target_os = "macos")]
+use rd_codec::videotoolbox::DecodedFrame;
+#[cfg(target_os = "windows")]
+use rd_codec::mediafoundation::DecodedFrame;
+
+use rd_signal::PeerId;
+use rd_viewer::control::RemoteControl;
+use rd_viewer::input_capture::InputCapture;
+use rd_viewer::metrics::Metrics;
+use rd_viewer::pipeline::Pipeline;
+use rd_viewer::video;
+
+use crate::net::{NetConfig, PeerAddress, Role};
+use crate::session::{Outcome, SessionState};
+use crate::ui;
+
+/// Cổng mặc định của host.
+///
+/// Cố định chứ không xin cổng ngẫu nhiên: người dùng nối thẳng theo IP phải gõ
+/// được cổng mà không cần hỏi bên kia, và mở cổng trên router cũng cần một số
+/// không đổi. Nằm trong dải cổng động nên hiếm khi đụng dịch vụ khác.
+const DEFAULT_PORT: u16 = 47823;
+
+pub const USAGE: &str = "\
+Điều khiển máy tính từ xa
+
+    remote-desktop [TUỲ CHỌN]
+
+Không tham số nào là bắt buộc; chúng chỉ điền sẵn màn hình đầu.
+
+    --host                 vào thẳng chế độ chia sẻ máy này
+    --connect ĐỊA_CHỈ|MÃ   vào thẳng chế độ điều khiển máy khác
+    --password MK          mật khẩu phiên (mặc định: sinh ngẫu nhiên)
+    --rendezvous ĐỊA_CHỈ   server hẹn gặp, để nối qua internet
+    --name TÊN             tên hiện cho máy kia
+    --fps N                số hình mỗi giây (mặc định 60)
+    --bitrate KBPS         băng thông video (mặc định 30000)
+    --port CỔNG            cổng chờ khi chia sẻ (mặc định 47823)
+    --downloads THƯ_MỤC    nơi lưu tệp nhận được
+    -h, --help             in bảng này
+";
+
+/// Tham số dòng lệnh. Tất cả đều tuỳ chọn — chúng chỉ điền sẵn màn hình đầu.
+#[derive(Debug, Clone)]
+pub struct Args {
+    /// Người dùng chỉ muốn xem cách dùng; đừng mở cửa sổ.
+    pub help: bool,
+    pub host: bool,
+    pub connect: Option<String>,
+    pub password: Option<String>,
+    pub rendezvous: Option<String>,
+    pub name: Option<String>,
+    pub fps: u32,
+    pub bitrate: u32,
+    pub downloads: Option<PathBuf>,
+    pub port: u16,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            help: false,
+            host: false,
+            connect: None,
+            password: None,
+            rendezvous: None,
+            name: None,
+            // 60 fps là nhịp quét của gần hết màn hình đang dùng. Đặt cao hơn
+            // chỉ tốn băng thông cho những frame màn hình không hiện kịp.
+            fps: 60,
+            bitrate: 30_000,
+            downloads: None,
+            port: DEFAULT_PORT,
+        }
+    }
+}
+
+impl Args {
+    pub fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut out = Args::default();
+        let mut args = args.peekable();
+        while let Some(arg) = args.next() {
+            // Mỗi cờ có giá trị đều phải lấy giá trị ngay tại đây; thiếu thì
+            // báo tên cờ chứ không im lặng bỏ qua.
+            let mut value = || {
+                args.next()
+                    .ok_or_else(|| format!("{arg} cần một giá trị đi kèm"))
+            };
+            match arg.as_str() {
+                "-h" | "--help" => out.help = true,
+                "--host" => out.host = true,
+                "--connect" => out.connect = Some(value()?),
+                "--password" => out.password = Some(value()?),
+                "--rendezvous" => out.rendezvous = Some(value()?),
+                "--name" => out.name = Some(value()?),
+                "--fps" => {
+                    out.fps = value()?
+                        .parse()
+                        .map_err(|_| "--fps phải là số".to_string())?
+                }
+                "--bitrate" => {
+                    out.bitrate = value()?
+                        .parse()
+                        .map_err(|_| "--bitrate phải là số kbps".to_string())?
+                }
+                "--port" => {
+                    out.port = value()?
+                        .parse()
+                        .map_err(|_| "--port phải là số cổng".to_string())?
+                }
+                "--downloads" => out.downloads = Some(PathBuf::from(value()?)),
+                other => return Err(format!("không hiểu tham số {other}")),
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Nội dung người dùng đang gõ ở màn hình đầu.
+struct Form {
+    target: String,
+    password: String,
+    rendezvous: String,
+    name: String,
+    fps: u32,
+    bitrate: u32,
+    downloads: String,
+    port: u16,
+}
+
+impl Form {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            target: args.connect.clone().unwrap_or_default(),
+            password: args.password.clone().unwrap_or_else(random_password),
+            rendezvous: args.rendezvous.clone().unwrap_or_default(),
+            name: args.name.clone().unwrap_or_else(machine_name),
+            fps: args.fps,
+            bitrate: args.bitrate,
+            downloads: args
+                .downloads
+                .clone()
+                .unwrap_or_else(default_downloads)
+                .display()
+                .to_string(),
+            port: args.port,
+        }
+    }
+
+    fn config(&self, role: Role, allow_10bit: bool) -> Result<NetConfig, String> {
+        let rendezvous = match self.rendezvous.trim() {
+            "" => None,
+            text => Some(resolve(text)?),
+        };
+        let peer = match role {
+            Role::Host => None,
+            Role::Viewer => Some(parse_peer(self.target.trim())?),
+        };
+        // Host phải nghe ở cổng đã hẹn; viewer thì cổng nào cũng được, xin cổng
+        // cố định chỉ tổ đụng nhau khi chạy hai bản trên cùng máy để thử.
+        let bind: SocketAddr = match role {
+            Role::Host => ([0, 0, 0, 0], self.port).into(),
+            Role::Viewer => ([0, 0, 0, 0], 0).into(),
+        };
+        Ok(NetConfig {
+            role,
+            bind,
+            rendezvous,
+            rendezvous_fingerprint: None,
+            peer_fingerprint: None,
+            peer,
+            name: self.name.trim().to_string(),
+            password: self.password.trim().to_string(),
+            target_fps: self.fps.clamp(1, 240),
+            bitrate_kbps: self.bitrate.clamp(500, 500_000),
+            allow_10bit,
+            download_dir: PathBuf::from(self.downloads.trim()),
+        })
+    }
+}
+
+enum Screen {
+    Start,
+    Session(Box<SessionState>),
+    Local(Box<LocalState>),
+}
+
+pub struct RdApp {
+    screen: Screen,
+    form: Form,
+    /// Card đồ hoạ dựng được texture 16-bit hay không — quyết định có xin video
+    /// 10-bit của máy kia không.
+    can_10bit: bool,
+    error: Option<String>,
+}
+
+impl RdApp {
+    pub fn new(cc: &eframe::CreationContext<'_>, args: Args) -> anyhow::Result<Self> {
+        let can_10bit = cc
+            .wgpu_render_state
+            .as_ref()
+            .map(|state| video::supports_10bit(&state.device))
+            .unwrap_or(false);
+        tracing::info!(can_10bit, "khởi động giao diện");
+
+        let form = Form::from_args(&args);
+        let mut app = Self {
+            screen: Screen::Start,
+            form,
+            can_10bit,
+            error: None,
+        };
+
+        // Có cờ dòng lệnh thì vào thẳng, khỏi phải bấm — chạy đi chạy lại lúc
+        // thử nghiệm mà mỗi lần còn phải bấm hai nút là mất thì giờ.
+        if args.host {
+            app.start(Role::Host);
+        } else if args.connect.is_some() {
+            app.start(Role::Viewer);
+        }
+        Ok(app)
+    }
+
+    fn start(&mut self, role: Role) {
+        let config = match self.form.config(role, self.can_10bit) {
+            Ok(config) => config,
+            Err(err) => {
+                self.error = Some(err);
+                return;
+            }
+        };
+        if let Err(err) = std::fs::create_dir_all(&config.download_dir) {
+            self.error = Some(format!("không tạo được thư mục nhận tệp: {err}"));
+            return;
+        }
+        match SessionState::start(config) {
+            Ok(state) => {
+                self.error = None;
+                self.screen = Screen::Session(Box::new(state));
+            }
+            Err(err) => self.error = Some(err.to_string()),
+        }
+    }
+
+    fn start_local(&mut self) {
+        match LocalState::start(self.form.fps, self.form.bitrate, self.can_10bit) {
+            Ok(state) => {
+                self.error = None;
+                self.screen = Screen::Local(Box::new(state));
+            }
+            Err(err) => self.error = Some(err.to_string()),
+        }
+    }
+
+    fn draw_start(&mut self, root: &mut egui::Ui) {
+        egui::CentralPanel::default().show(root, |ui| {
+            ui.add_space(16.0);
+            ui.vertical_centered(|ui| {
+                ui.heading("Điều khiển máy tính từ xa");
+                ui.label(
+                    egui::RichText::new(if self.can_10bit {
+                        "card đồ hoạ hiển thị được 10-bit"
+                    } else {
+                        "card đồ hoạ chỉ hiển thị 8-bit"
+                    })
+                    .small(),
+                );
+            });
+            ui.add_space(16.0);
+
+            egui::Grid::new("cấu hình")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Tên hiện cho máy kia");
+                    ui.text_edit_singleline(&mut self.form.name);
+                    ui.end_row();
+
+                    ui.label("Mật khẩu phiên");
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.form.password);
+                        if ui.button("Đổi").clicked() {
+                            self.form.password = random_password();
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("Rendezvous server");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.form.rendezvous)
+                            .hint_text("bỏ trống nếu nối thẳng trong mạng nhà"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Thư mục nhận tệp");
+                    ui.text_edit_singleline(&mut self.form.downloads);
+                    ui.end_row();
+
+                    ui.label("Chất lượng");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut self.form.fps).range(15..=240));
+                        ui.label("fps");
+                        ui.add(
+                            egui::DragValue::new(&mut self.form.bitrate)
+                                .range(1_000..=200_000)
+                                .speed(500),
+                        );
+                        ui.label("kbps");
+                    });
+                    ui.end_row();
+
+                    ui.label("Cổng chờ (khi chia sẻ)");
+                    ui.add(egui::DragValue::new(&mut self.form.port).range(1024..=65535));
+                    ui.end_row();
+                });
+
+            ui.add_space(20.0);
+            ui.separator();
+            ui.add_space(12.0);
+
+            ui.columns(2, |columns| {
+                columns[0].group(|ui| {
+                    ui.set_min_height(150.0);
+                    ui.heading("Cho điều khiển máy này");
+                    ui.label(
+                        egui::RichText::new(
+                            "Máy này hiện màn hình cho người kia xem và nhận chuột phím của họ. \
+                             Sau khi bấm sẽ có mã và mật khẩu để đọc cho người kia.",
+                        )
+                        .small(),
+                    );
+                    ui.add_space(8.0);
+                    if ui
+                        .add(egui::Button::new("Bắt đầu chia sẻ").min_size(egui::vec2(180.0, 32.0)))
+                        .clicked()
+                    {
+                        self.start(Role::Host);
+                    }
+                });
+
+                columns[1].group(|ui| {
+                    ui.set_min_height(150.0);
+                    ui.heading("Điều khiển máy khác");
+                    ui.label(
+                        egui::RichText::new(
+                            "Gõ mã 9 chữ số của máy kia, hoặc địa chỉ IP:cổng nếu hai máy \
+                             cùng mạng. Mật khẩu phải khớp với mật khẩu máy kia đang hiện.",
+                        )
+                        .small(),
+                    );
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.form.target)
+                            .hint_text("123 456 789 hoặc 192.168.1.10:47823")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(8.0);
+                    if ui
+                        .add(egui::Button::new("Kết nối").min_size(egui::vec2(180.0, 32.0)))
+                        .clicked()
+                    {
+                        self.start(Role::Viewer);
+                    }
+                });
+            });
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("Thử tại chỗ (đo độ trễ không qua mạng)").clicked() {
+                    self.start_local();
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "chụp rồi giải mã ngay trong máy — con số nó cho ra là sàn \
+                         mà chạy hai máy không thể vượt qua",
+                    )
+                    .small(),
+                );
+            });
+
+            if let Some(error) = &self.error {
+                ui.add_space(10.0);
+                ui.colored_label(ui::BAD, error);
+            }
+        });
+    }
+}
+
+impl eframe::App for RdApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let leave = match &mut self.screen {
+            Screen::Start => {
+                self.draw_start(ui);
+                false
+            }
+            Screen::Session(state) => matches!(state.update(ui), Outcome::Leave),
+            Screen::Local(state) => state.update(ui),
+        };
+        if leave {
+            // Thả `SessionState` ở đây là dừng luồng mạng và đóng kết nối; màn
+            // hình đầu phải sạch để bấm nối lại được ngay.
+            self.screen = Screen::Start;
+        }
+    }
+}
+
+// ───────────────────────── chế độ thử tại chỗ ─────────────────────────
+
+/// Chụp → mã hoá → giải mã ngay trong máy, không qua mạng.
+pub struct LocalState {
+    pipeline: Pipeline,
+    current: Option<Arc<DecodedFrame>>,
+    metrics: Metrics,
+    capture: InputCapture,
+    control: RemoteControl,
+    show_hud: bool,
+    last_report: Instant,
+}
+
+impl LocalState {
+    fn start(fps: u32, bitrate: u32, allow_10bit: bool) -> anyhow::Result<Self> {
+        Ok(Self {
+            pipeline: Pipeline::start(fps, bitrate, allow_10bit)?,
+            current: None,
+            metrics: Metrics::default(),
+            capture: InputCapture::new(),
+            control: RemoteControl::new(),
+            show_hud: true,
+            last_report: Instant::now(),
+        })
+    }
+
+    /// Trả về `true` khi người dùng muốn về màn hình đầu.
+    fn update(&mut self, root: &mut egui::Ui) -> bool {
+        let ctx = root.ctx().clone();
+        if let Some(frame) = self.pipeline.latest() {
+            self.metrics.push(
+                frame.pipeline_us,
+                frame.encode_us,
+                frame.decode_us,
+                frame.bytes,
+                frame.keyframe,
+            );
+            self.current = Some(frame.frame);
+        }
+
+        ctx.input_mut(|i| {
+            if i.key_pressed(egui::Key::F10) {
+                self.show_hud = !self.show_hud;
+            }
+            if i.key_pressed(egui::Key::F9) {
+                let on = !self.control.enabled();
+                self.control.set_enabled(on);
+            }
+        });
+
+        let mut leave = false;
+        egui::Panel::top("thanh-local").show(root, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("← Thoát").clicked() {
+                    leave = true;
+                }
+                ui.separator();
+                ui.label("Thử tại chỗ");
+                ui.separator();
+                let counters = self.pipeline.counters();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "chụp {} · mã hoá {} · giải mã {} · bỏ {} · lỗi {}",
+                        counters.captured,
+                        counters.encoded,
+                        counters.decoded,
+                        counters.dropped_late,
+                        counters.errors
+                    ))
+                    .monospace()
+                    .small(),
+                );
+            });
+        });
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(root, |ui| {
+                let outer = ui.max_rect();
+                ui::paint_backdrop(ui, outer);
+                let info = self.pipeline.info().clone();
+                let rect = ui::video_rect(outer, info.width, info.height);
+                if let Some(frame) = &self.current {
+                    ui::draw_video(ui, rect, frame);
+                }
+
+                if self.control.enabled() {
+                    let events = ui.input(|i| i.events.clone());
+                    let translated = self.capture.translate(&events, rect);
+                    self.control.send(&translated);
+                }
+
+                if self.show_hud {
+                    let lines = vec![
+                        (
+                            format!("điều khiển: {} (F9)", self.control.note()),
+                            if self.control.enabled() {
+                                ui::GOOD
+                            } else {
+                                ui::WARN
+                            },
+                        ),
+                        ("F10 ẩn/hiện bảng này".to_string(), ui::WARN),
+                    ];
+                    let data = ui::HudData {
+                        info: Some(&info),
+                        summary: self.metrics.summary(),
+                        lines,
+                        network_ms: None,
+                    };
+                    ui::hud_at(ui, outer, &data);
+                }
+            });
+
+        self.metrics.repaints += 1;
+        if self.last_report.elapsed() >= std::time::Duration::from_secs(2) {
+            self.last_report = Instant::now();
+            let summary = self.metrics.summary();
+            tracing::info!(
+                fps = summary.fps,
+                p50_ms = summary.pipeline_p50_ms,
+                p99_ms = summary.pipeline_p99_ms,
+                mbps = summary.mbps,
+                "thống kê thử tại chỗ"
+            );
+        }
+        ctx.request_repaint();
+        leave
+    }
+}
+
+// ───────────────────────────── tiện ích ─────────────────────────────
+
+/// Hiểu cả hai cách người dùng chỉ tới máy kia: mã 9 chữ số, hay địa chỉ mạng.
+fn parse_peer(text: &str) -> Result<PeerAddress, String> {
+    if text.is_empty() {
+        return Err("chưa nhập mã hoặc địa chỉ của máy kia".into());
+    }
+    // Thử mã trước: "123456789" cũng là tên miền hợp lệ về mặt cú pháp, nên để
+    // phân giải tên chạy trước là mã sẽ không bao giờ tới lượt.
+    if let Ok(id) = PeerId::from_str(text) {
+        return Ok(PeerAddress::Code(id));
+    }
+    resolve(text).map(PeerAddress::Direct)
+}
+
+/// Đổi "máy:cổng" thành địa chỉ. Thiếu cổng thì hiểu là cổng mặc định.
+fn resolve(text: &str) -> Result<SocketAddr, String> {
+    let with_port = if text.contains(':') {
+        text.to_string()
+    } else {
+        format!("{text}:{DEFAULT_PORT}")
+    };
+    with_port
+        .to_socket_addrs()
+        .map_err(|err| format!("không hiểu địa chỉ {text}: {err}"))?
+        .next()
+        .ok_or_else(|| format!("{text} không phân giải ra địa chỉ nào"))
+}
+
+/// Sáu chữ số ngẫu nhiên. Đủ ngắn để đọc qua điện thoại, và mỗi lần chạy một
+/// khác nên không có mật khẩu mặc định để ai đó thử.
+fn random_password() -> String {
+    use rand::Rng as _;
+    format!("{:06}", rand::rng().random_range(0..1_000_000u32))
+}
+
+fn machine_name() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "máy không tên".into())
+}
+
+fn default_downloads() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    home.join("Downloads")
+}

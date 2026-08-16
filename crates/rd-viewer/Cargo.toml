@@ -1,0 +1,41 @@
+[package]
+name = "rd-viewer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rd-protocol = { workspace = true }
+rd-codec = { workspace = true }
+rd-capture = { workspace = true }
+rd-input = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+wgpu = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = ["MTLAllocation", "MTLResource", "MTLTexture", "MTLDevice", "MTLPixelFormat", "objc2-io-surface"] }
+objc2-io-surface = { version = "0.3", features = ["IOSurfaceRef", "IOSurfaceTypes"] }
+objc2-core-video = { version = "0.3", features = ["CVPixelBuffer", "CVPixelBufferIOSurface", "CVImageBuffer", "CVBuffer", "CVReturn", "objc2-io-surface"] }
+objc2-core-foundation = { version = "0.3", features = ["CFBase", "CFDictionary"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Cùng bản 0.62 mà rd-capture, rd-codec và wgpu-hal dùng — lệch bản là con trỏ
+# COM thành hai kiểu khác nhau và không truyền qua lại được.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+pollster = "1"
