@@ -24,6 +24,58 @@ use crate::net::{NetConfig, PeerAddress, Role};
 use crate::session::{Outcome, SessionState};
 use crate::ui;
 
+/// Nạp một font hệ thống có đủ chữ Việt có dấu.
+///
+/// Font mặc định của egui dừng ở Latin Extended-A, mà phần lớn dấu tiếng Việt
+/// (ề, ử, ọ, ậ...) nằm ở Latin Extended Additional — thiếu thì hiện ra ô vuông.
+/// Mượn font sẵn có của hệ điều hành thay vì nhúng thêm một file font: không
+/// làm chương trình nặng thêm, và chữ trông giống hệt các ứng dụng khác trên
+/// cùng máy. Danh sách xếp theo thứ tự ưu tiên, lấy file đầu tiên đọc được.
+fn install_vietnamese_font(ctx: &egui::Context) {
+    #[cfg(target_os = "macos")]
+    const CANDIDATES: &[&str] = &[
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ];
+    #[cfg(target_os = "windows")]
+    const CANDIDATES: &[&str] = &[
+        r"C:\Windows\Fonts\segoeui.ttf",
+        r"C:\Windows\Fonts\tahoma.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
+    ];
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    const CANDIDATES: &[&str] = &[];
+
+    const NAME: &str = "hệ thống";
+
+    let Some((path, bytes)) = CANDIDATES
+        .iter()
+        .find_map(|path| Some((*path, std::fs::read(path).ok()?)))
+    else {
+        tracing::warn!("không đọc được font hệ thống nào, chữ có dấu sẽ hiện ra ô vuông");
+        return;
+    };
+
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert(NAME.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, NAME.to_owned());
+    // Ở chỗ chữ đều nhau thì để nó đứng cuối: chỉ dùng khi font kia không có
+    // ký tự, nhờ vậy các con số vẫn thẳng cột như cũ.
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .push(NAME.to_owned());
+    ctx.set_fonts(fonts);
+    tracing::info!(path, "dùng font hệ thống cho chữ có dấu");
+}
+
 /// Cổng mặc định của host.
 ///
 /// Cố định chứ không xin cổng ngẫu nhiên: người dùng nối thẳng theo IP phải gõ
@@ -212,6 +264,7 @@ impl RdApp {
             .map(|state| video::supports_10bit(&state.device))
             .unwrap_or(false);
         tracing::info!(can_10bit, "khởi động giao diện");
+        install_vietnamese_font(&cc.egui_ctx);
 
         let form = Form::from_args(&args);
         let mut app = Self {
@@ -593,4 +646,58 @@ fn default_downloads() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     home.join("Downloads")
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+mod tests {
+    use super::*;
+
+    /// Mọi chữ Việt có dấu dùng trong giao diện phải có glyph thật.
+    ///
+    /// Thiếu thì egui vẽ ra ô vuông — đúng lỗi mà font mặc định của nó gây ra,
+    /// vì font ấy dừng ở Latin Extended-A.
+    const CHU_KHO: &str = "ềửọậợỹăđâêôơưựếịốồùáíãõẻẩ";
+
+    /// Kết thúc lượt vẽ và vứt bỏ texture vừa dựng. Không dọn thì `FullOutput`
+    /// nổ lúc `Drop` vì tưởng người gọi quên đẩy texture lên GPU.
+    fn end_pass(ctx: &egui::Context) {
+        let mut out = ctx.end_pass();
+        out.textures_delta.clear();
+    }
+
+    /// Chỉ kiểm họ chữ thường (`Proportional`) — gần như toàn bộ chữ trong giao
+    /// diện nằm ở đó. Họ chữ đều nhau không kiểm được bằng cách này: epaint coi
+    /// một ký tự là "thiếu" khi nó rơi vào đúng font đang giữ ký tự thay thế,
+    /// mà font ấy lại là Hack đứng đầu họ, nên mọi chữ Hack có đều bị báo thiếu
+    /// oan. Ở đó font hệ thống đứng cuối làm lớp đỡ, Hack thiếu chữ nào thì nó
+    /// nhận chữ đó.
+    #[test]
+    fn font_giao_dien_du_chu_viet() {
+        let ctx = egui::Context::default();
+        install_vietnamese_font(&ctx);
+        // egui chỉ dựng bộ font khi bắt đầu vẽ, trước đó chưa hỏi được.
+        ctx.begin_pass(Default::default());
+        let thieu: Vec<char> = ctx.fonts_mut(|f| {
+            CHU_KHO
+                .chars()
+                .filter(|c| !f.has_glyph(&egui::FontId::proportional(14.0), *c))
+                .collect()
+        });
+        end_pass(&ctx);
+
+        assert!(thieu.is_empty(), "font giao diện thiếu chữ {thieu:?}");
+    }
+
+    /// Chốt lại rằng test trên có ý nghĩa: font mặc định của egui đúng là
+    /// thiếu. Ngày nào egui đổi font mặc định thành font đủ chữ thì test này
+    /// đỏ, và đó là lúc bỏ hẳn được `install_vietnamese_font`.
+    #[test]
+    fn font_mac_dinh_cua_egui_van_thieu_chu_viet() {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(Default::default());
+        let du = ctx.fonts_mut(|f| f.has_glyphs(&egui::FontId::proportional(14.0), CHU_KHO));
+        end_pass(&ctx);
+
+        assert!(!du, "egui đã có sẵn chữ Việt, không cần mượn font hệ thống nữa");
+    }
 }
