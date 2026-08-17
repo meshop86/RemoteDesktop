@@ -2431,7 +2431,7 @@ dependencies = [
 
 [[package]]
 name = "rd-app"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2447,6 +2447,7 @@ dependencies = [
  "rd-transport",
  "rd-viewer",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2457,7 +2458,7 @@ dependencies = [
 
 [[package]]
 name = "rd-capture"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "block2 0.6.2",
  "dispatch2",
@@ -2477,7 +2478,7 @@ dependencies = [
 
 [[package]]
 name = "rd-codec"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "objc2 0.6.4",
  "objc2-core-foundation",
@@ -2494,7 +2495,7 @@ dependencies = [
 
 [[package]]
 name = "rd-input"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "objc2-core-foundation",
  "objc2-core-graphics",
@@ -2506,7 +2507,7 @@ dependencies = [
 
 [[package]]
 name = "rd-protocol"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytes",
  "postcard",
@@ -2516,7 +2517,7 @@ dependencies = [
 
 [[package]]
 name = "rd-session"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "rd-protocol",
  "tracing",
@@ -2524,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "rd-signal"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "parking_lot",
@@ -2541,7 +2542,7 @@ dependencies = [
 
 [[package]]
 name = "rd-transport"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "blake3",
  "bytes",
@@ -2559,7 +2560,7 @@ dependencies = [
 
 [[package]]
 name = "rd-viewer"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "eframe",
@@ -2813,6 +2814,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "serde_json"
+version = "1.0.151"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
 ]
 
 [[package]]
@@ -4160,6 +4174,12 @@ name = "zeroize"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zune-core"

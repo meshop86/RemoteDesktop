@@ -68,6 +68,23 @@ trình chết theo, không kịp báo gì. Cứ **mở lại lần nữa**: lầ
 tự bỏ qua đường vẽ vừa hỏng và thử đường khác. Muốn tự chọn thì đặt biến môi
 trường `WGPU_BACKEND` thành `dx12`, `vulkan` hoặc `gl`.
 
+### Nối được nhưng không thấy màn hình, không điều khiển được
+
+Chạy lệnh sau ở máy đang trục trặc — nó liệt kê màn hình, chụp thử một khung
+hình thật, rồi in ra codec máy này mã hoá và giải mã được:
+
+```
+remote-desktop --probe
+```
+
+Dòng `Chụp thử màn hình chính: KHÔNG được` nghĩa là chương trình không lấy được
+hình từ hệ điều hành, nên bên kia chỉ thấy hình tổng hợp; lý do in kèm ngay đó.
+
+Ở mục Video, `giải mã được: [H264]` (không có `Hevc`) là chuyện bình thường trên
+Windows: bộ giải mã HEVC không có sẵn mà nằm trong gói *HEVC Video Extensions*
+của Microsoft Store. Từ bản 0.1.6, hai máy tự thoả thuận codec chung nên vẫn
+chạy được bằng H.264; cài thêm gói đó thì hình nét hơn ở cùng băng thông.
+
 ### Quyền trên macOS
 
 Máy **chia sẻ màn hình** phải được cấp hai quyền, nếu không chương trình vẫn
@@ -95,7 +112,23 @@ Phím tắt khi đang xem: `F9` bật/tắt điều khiển, `F8` ẩn/hiện b�
 
 `remote-desktop --help` in đủ danh sách tham số.
 
-## Nối qua Internet
+## Nối qua Tailscale (cách dễ nhất)
+
+Nếu hai máy đều là máy của bạn, cài [Tailscale](https://tailscale.com/download)
+rồi đăng nhập cùng một tài khoản là xong: không cần rendezvous server, không
+phải mở cổng trên router, và địa chỉ không đổi khi chuyển mạng.
+
+Chương trình tự nhận ra Tailscale và hiện một khung ở màn hình đầu:
+
+- chưa đăng nhập thì có nút **Đăng nhập Tailscale** (mở trang đăng nhập của họ);
+- đăng nhập rồi mà đang tắt thì có nút **Bật kết nối**;
+- xong xuôi thì khung hiện địa chỉ `100.x.y.z:47823` của máy này để đọc cho
+  người kia, kèm danh sách các máy khác trong tailnet — bấm một máy là địa chỉ
+  tự điền vào ô kết nối.
+
+Máy chia sẻ vẫn bấm **Bắt đầu chia sẻ** như thường; mật khẩu phiên vẫn phải khớp.
+
+## Nối qua Internet không cần Tailscale
 
 Hai máy ở hai mạng khác nhau cần một **rendezvous server** đặt ở nơi có IP công
 cộng để chúng tìm nhau và đục lỗ NAT:

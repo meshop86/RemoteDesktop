@@ -29,6 +29,7 @@
 mod app;
 mod net;
 mod session;
+mod tailscale;
 mod ui;
 
 use std::{
@@ -224,6 +225,10 @@ fn main() {
     };
     if args.help {
         println!("{}", app::USAGE);
+        return;
+    }
+    if args.probe {
+        println!("{}", app::probe());
         return;
     }
 

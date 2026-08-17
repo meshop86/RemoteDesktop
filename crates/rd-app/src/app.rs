@@ -99,6 +99,7 @@ Không tham số nào là bắt buộc; chúng chỉ điền sẵn màn hình đ
     --bitrate KBPS         băng thông video (mặc định 30000)
     --port CỔNG            cổng chờ khi chia sẻ (mặc định 47823)
     --downloads THƯ_MỤC    nơi lưu tệp nhận được
+    --probe                in khả năng của máy này rồi thoát
     -h, --help             in bảng này
 ";
 
@@ -107,6 +108,8 @@ Không tham số nào là bắt buộc; chúng chỉ điền sẵn màn hình đ
 pub struct Args {
     /// Người dùng chỉ muốn xem cách dùng; đừng mở cửa sổ.
     pub help: bool,
+    /// In khả năng của máy rồi thoát, không mở cửa sổ.
+    pub probe: bool,
     pub host: bool,
     pub connect: Option<String>,
     pub password: Option<String>,
@@ -122,6 +125,7 @@ impl Default for Args {
     fn default() -> Self {
         Self {
             help: false,
+            probe: false,
             host: false,
             connect: None,
             password: None,
@@ -150,6 +154,7 @@ impl Args {
             };
             match arg.as_str() {
                 "-h" | "--help" => out.help = true,
+                "--probe" => out.probe = true,
                 "--host" => out.host = true,
                 "--connect" => out.connect = Some(value()?),
                 "--password" => out.password = Some(value()?),
@@ -176,6 +181,91 @@ impl Args {
         }
         Ok(out)
     }
+}
+
+/// Bảng khai máy này làm được gì, in ra bởi `--probe`.
+///
+/// Có mục "chụp thử một frame" chứ không chỉ liệt kê màn hình, vì đúng cái lỗi
+/// khó thấy nhất nằm ở khoảng giữa: hệ điều hành khai có màn hình, nhưng mở
+/// luồng chụp lại hỏng, và lúc đó chương trình lặng lẽ phát hình tổng hợp thay
+/// vì báo lỗi. Người ngồi ở máy chia sẻ không thấy gì bất thường cả.
+pub fn probe() -> String {
+    use rd_capture::ScreenCapturer as _;
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "remote-desktop {} trên {} {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+
+    let _ = writeln!(out, "\nMàn hình:");
+    match rd_capture::PlatformCapturer::list_displays() {
+        Ok(displays) if displays.is_empty() => {
+            let _ = writeln!(out, "  (hệ điều hành không khai màn hình nào)");
+        }
+        Ok(displays) => {
+            for display in displays {
+                let _ = writeln!(
+                    out,
+                    "  [{}] {} — {}x{} @ {}Hz{}",
+                    display.id,
+                    display.name,
+                    display.width,
+                    display.height,
+                    display.refresh_hz,
+                    if display.is_primary { " (chính)" } else { "" }
+                );
+            }
+        }
+        Err(err) => {
+            let _ = writeln!(out, "  không liệt kê được: {err}");
+        }
+    }
+
+    let _ = writeln!(out, "\nChụp thử màn hình chính:");
+    match rd_capture::PlatformCapturer::start(rd_capture::CaptureConfig::default()) {
+        Ok(mut capturer) => {
+            match capturer.next_frame(std::time::Duration::from_secs(5)) {
+                Ok(frame) => {
+                    let _ = writeln!(out, "  được — frame {}x{}", frame.width, frame.height);
+                }
+                Err(err) => {
+                    let _ = writeln!(out, "  mở được luồng nhưng không có frame nào: {err}");
+                }
+            }
+            capturer.stop();
+        }
+        Err(err) => {
+            let _ = writeln!(out, "  KHÔNG được: {err}");
+            let _ = writeln!(
+                out,
+                "  → khi chia sẻ, người kia sẽ thấy hình tổng hợp chứ không phải màn hình này"
+            );
+        }
+    }
+
+    let _ = writeln!(out, "\nVideo:");
+    let _ = writeln!(out, "  mã hoá được:  {:?}", rd_codec::encodable());
+    let decodable = rd_codec::decodable();
+    let _ = writeln!(out, "  giải mã được: {decodable:?}");
+    if !decodable.contains(&rd_codec::Codec::Hevc) {
+        let _ = writeln!(
+            out,
+            "  → thiếu bộ giải mã HEVC; phiên sẽ tự lùi về H.264 (tốn băng thông hơn ~30%).\n    \
+             Cài \"HEVC Video Extensions\" trong Microsoft Store để dùng HEVC."
+        );
+    }
+
+    let _ = writeln!(out, "\nTailscale:");
+    for line in crate::tailscale::describe().lines() {
+        let _ = writeln!(out, "  {line}");
+    }
+
+    out
 }
 
 /// Nội dung người dùng đang gõ ở màn hình đầu.
@@ -253,6 +343,8 @@ pub struct RdApp {
     /// Card đồ hoạ dựng được texture 16-bit hay không — quyết định có xin video
     /// 10-bit của máy kia không.
     can_10bit: bool,
+    /// Trạng thái Tailscale, hỏi trên luồng nền (xem `crate::tailscale`).
+    tailscale: crate::tailscale::Watcher,
     error: Option<String>,
 }
 
@@ -271,6 +363,7 @@ impl RdApp {
             screen: Screen::Start,
             form,
             can_10bit,
+            tailscale: crate::tailscale::Watcher::new(),
             error: None,
         };
 
@@ -315,6 +408,136 @@ impl RdApp {
         }
     }
 
+    /// Khung Tailscale: cho biết máy này đang ở đâu trong tailnet và cho bấm
+    /// thẳng vào một máy khác thay vì gõ địa chỉ.
+    ///
+    /// Có Tailscale rồi thì không cần rendezvous server nữa: địa chỉ `100.x.y.z`
+    /// đứng yên ở mọi mạng, hai máy tự tìm nhau kể cả sau NAT.
+    fn draw_tailscale(&mut self, ui: &mut egui::Ui) {
+        use crate::tailscale::State;
+
+        // Người dùng đăng nhập xong ở trình duyệt, hay máy kia vừa bật: hỏi lại
+        // đều đặn thì khung này tự đúng, khỏi phải bấm Làm mới.
+        self.tailscale.tick(std::time::Duration::from_secs(5));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs(1));
+
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Tailscale");
+                ui.add_space(6.0);
+                if self.tailscale.busy() {
+                    ui.spinner();
+                } else if ui.small_button("Làm mới").clicked() {
+                    self.tailscale.refresh();
+                }
+            });
+
+            let status = self.tailscale.snapshot();
+            let Some(state) = status.state.clone() else {
+                ui.label(egui::RichText::new("đang kiểm tra…").small());
+                return;
+            };
+
+            match state {
+                State::NotInstalled => {
+                    ui.label(
+                        egui::RichText::new(
+                            "Chưa cài. Cài Tailscale trên cả hai máy rồi đăng nhập cùng một \
+                             tài khoản là nối được qua internet mà không cần rendezvous server \
+                             và không phải mở cổng trên router.",
+                        )
+                        .small(),
+                    );
+                    ui.hyperlink_to("Tải Tailscale", "https://tailscale.com/download");
+                }
+                State::Stopped => {
+                    ui.colored_label(ui::WARN, "Đã cài nhưng chưa bật.");
+                    if ui.button("Bật kết nối").clicked() {
+                        self.tailscale.up();
+                    }
+                }
+                State::NeedsLogin => {
+                    ui.colored_label(ui::WARN, "Chưa đăng nhập.");
+                    if ui.button("Đăng nhập Tailscale").clicked() {
+                        self.tailscale.login();
+                    }
+                }
+                State::Broken(reason) => {
+                    ui.colored_label(ui::BAD, reason);
+                }
+                State::Running => self.draw_tailnet(ui, &status),
+            }
+
+            if let Some(message) = self.tailscale.message() {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(message).small());
+            }
+        });
+    }
+
+    /// Phần chỉ hiện khi Tailscale đã đăng nhập: địa chỉ máy này và danh sách máy khác.
+    fn draw_tailnet(&mut self, ui: &mut egui::Ui, status: &crate::tailscale::Status) {
+        let port = self.form.port;
+
+        ui.horizontal(|ui| {
+            ui.colored_label(ui::GOOD, "Đã kết nối tailnet");
+            ui.label(egui::RichText::new(format!("máy này: {}", status.self_name)).small());
+        });
+
+        if let Some(ip) = &status.self_ip {
+            let address = format!("{ip}:{port}");
+            ui.horizontal(|ui| {
+                ui.label("Địa chỉ để máy kia gõ:");
+                ui.monospace(&address);
+                if ui.small_button("Chép").clicked() {
+                    ui.ctx().copy_text(address.clone());
+                }
+            });
+        }
+
+        ui.add_space(6.0);
+        if status.peers.is_empty() {
+            ui.label(
+                egui::RichText::new(
+                    "Chưa thấy máy nào khác. Đăng nhập cùng tài khoản Tailscale ở máy kia.",
+                )
+                .small(),
+            );
+            return;
+        }
+
+        ui.label(egui::RichText::new("Bấm một máy để điền sẵn địa chỉ:").small());
+        // Nhiều máy thì đừng để danh sách đẩy hai nút chính xuống khỏi cửa sổ.
+        egui::ScrollArea::vertical()
+            .max_height(120.0)
+            .show(ui, |ui| {
+                for peer in &status.peers {
+                    ui.horizontal(|ui| {
+                        let label = if peer.os.is_empty() {
+                            peer.name.clone()
+                        } else {
+                            format!("{} ({})", peer.name, peer.os)
+                        };
+                        // Máy đang tắt vẫn hiện ra — biết nó tồn tại mà đang tắt
+                        // thì đỡ hơn là không thấy đâu và tưởng mình nhìn nhầm.
+                        if ui
+                            .add_enabled(peer.online, egui::Button::new(label))
+                            .clicked()
+                        {
+                            self.form.target = format!("{}:{port}", peer.ip);
+                            self.error = None;
+                        }
+                        ui.label(
+                            egui::RichText::new(if peer.online { "đang bật" } else { "đang tắt" })
+                                .small()
+                                .color(if peer.online { ui::GOOD } else { ui::WARN }),
+                        );
+                    });
+                }
+            });
+    }
+
     fn draw_start(&mut self, root: &mut egui::Ui) {
         egui::CentralPanel::default().show(root, |ui| {
             ui.add_space(16.0);
@@ -351,7 +574,7 @@ impl RdApp {
                     ui.label("Rendezvous server");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.form.rendezvous)
-                            .hint_text("bỏ trống nếu nối thẳng trong mạng nhà"),
+                            .hint_text("bỏ trống nếu nối thẳng trong mạng nhà hoặc qua Tailscale"),
                     );
                     ui.end_row();
 
@@ -377,7 +600,10 @@ impl RdApp {
                     ui.end_row();
                 });
 
-            ui.add_space(20.0);
+            ui.add_space(14.0);
+            self.draw_tailscale(ui);
+
+            ui.add_space(16.0);
             ui.separator();
             ui.add_space(12.0);
 

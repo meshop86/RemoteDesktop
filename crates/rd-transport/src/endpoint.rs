@@ -7,7 +7,8 @@
 //!   nên giữ hàng đợi ngắn, đúng thứ video tương tác cần.
 //! * **Datagram buffer lớn** — một keyframe 4K có thể vài megabyte, chia thành
 //!   hàng nghìn datagram bắn ra trong vài mili giây.
-//! * **initial_mtu 1350** — bắt đầu ngay ở mức gần tối ưu thay vì dò từ 1200.
+//! * **initial_mtu 1280** — vừa vặn cả đường qua Tailscale/WireGuard; quinn tự
+//!   dò lên cao hơn khi đường truyền cho phép.
 //! * **keep_alive 2s** — giữ lỗ NAT luôn mở khi màn hình đứng yên không gửi gì.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -38,7 +39,10 @@ pub fn transport_config() -> TransportConfig {
     config.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     config.datagram_send_buffer_size(4 * 1024 * 1024);
     config.congestion_controller_factory(Arc::new(BbrConfig::default()));
-    config.initial_mtu(1350);
+    // 1280 là MTU của card mạng ảo Tailscale/WireGuard, cũng là sàn của IPv6.
+    // Đoán cao hơn thì gói đầu tiên rơi im lặng ở đó và bắt tay phải chờ hết
+    // một lượt truyền lại. Không mất gì: quinn vẫn tự dò lên tới 1452 sau đó.
+    config.initial_mtu(1280);
     config.min_mtu(1200);
     config
 }
