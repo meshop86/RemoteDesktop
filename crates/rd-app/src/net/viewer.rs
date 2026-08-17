@@ -122,11 +122,17 @@ pub async fn run(
 
     let (mut tx, mut rx) = session.open_control::<ViewerCommand, HostEvent>().await?;
     // Gửi ngay, xem ghi chú đầu file.
+    // Khai đúng những gì máy này giải mã được. Host chốt codec theo danh sách
+    // này, nên khai thừa là phiên nối xong rồi tắt ngay vì không dựng nổi bộ
+    // giải mã, còn khai thiếu chỉ là mất chút băng thông.
+    let codecs = rd_codec::decodable();
+    tracing::info!(?codecs, "khai codec giải mã được");
     tx.send(&ViewerCommand::Hello {
         version: rd_protocol::PROTOCOL_VERSION,
         viewer_name: ctx.config.name.clone(),
         auth: ctx.auth(),
         wants_10bit: ctx.config.allow_10bit,
+        codecs,
     })
     .await?;
 

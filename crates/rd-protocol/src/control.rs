@@ -178,6 +178,14 @@ pub enum ViewerCommand {
         /// máy không dựng được texture 16-bit thì hình ra sai màu, mà lúc đó
         /// đổi lại là phải dựng lại cả chuỗi mã hoá giữa phiên.
         wants_10bit: bool,
+        /// Codec mà máy xem **giải mã** được, xếp theo thứ tự ưu tiên của nó.
+        ///
+        /// Host chỉ được mã hoá bằng codec nằm trong danh sách này. Không hỏi mà
+        /// cứ chọn HEVC là gặp đúng cái bẫy của Windows: bộ giải mã HEVC không
+        /// có sẵn trong Windows (nằm ở gói "HEVC Video Extensions" của Store),
+        /// nên phiên nối xong, báo thành công, rồi tắt ngay vì viewer không dựng
+        /// nổi bộ giải mã.
+        codecs: Vec<Codec>,
     },
     SelectMonitor {
         monitor: u8,

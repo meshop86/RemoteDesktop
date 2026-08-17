@@ -26,7 +26,9 @@ pub const MAX_DATAGRAM_SIZE: usize = 1200;
 pub const MAX_VIDEO_PAYLOAD: usize = MAX_DATAGRAM_SIZE - VIDEO_HEADER_LEN;
 
 /// Phiên bản giao thức. Hai đầu khác phiên bản thì từ chối bắt tay ngay.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// 2: lời chào của viewer mang thêm danh sách codec nó giải mã được.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {

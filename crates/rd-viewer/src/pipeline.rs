@@ -91,7 +91,16 @@ impl EncodeSource {
     /// `allow_10bit` do phần cứng đồ hoạ của **người xem** quyết định: thiếu
     /// texture 16-bit chuẩn hoá thì không hiển thị được 4:2:2 10-bit, nên phải
     /// lùi về 4:2:0 8-bit ngay từ khâu mã hoá thay vì để hỏng ở khâu vẽ.
-    pub fn start(target_fps: u32, bitrate_kbps: u32, allow_10bit: bool) -> anyhow::Result<Self> {
+    ///
+    /// `viewer_codecs` cũng vậy: codec phải chốt *trước* khi dựng bộ mã hoá, và
+    /// chốt theo khả năng của cả hai đầu.
+    pub fn start(
+        target_fps: u32,
+        bitrate_kbps: u32,
+        allow_10bit: bool,
+        viewer_codecs: &[Codec],
+    ) -> anyhow::Result<Self> {
+        let codec = pick_codec(viewer_codecs)?;
         let capture_config = CaptureConfig {
             target_fps,
             ..Default::default()
@@ -103,7 +112,7 @@ impl EncodeSource {
         let config = EncoderConfig {
             width,
             height,
-            codec: Codec::Hevc,
+            codec,
             chroma: if allow_10bit {
                 ChromaSubsampling::Yuv422
             } else {
@@ -125,7 +134,7 @@ impl EncodeSource {
             source: source_name,
             width,
             height,
-            codec: Codec::Hevc,
+            codec,
             chroma: encoder.actual_chroma(),
             hardware: encoder.is_hardware(),
             target_fps,
@@ -179,6 +188,24 @@ impl EncodeSource {
     pub fn stop(&mut self) {
         self.source.stop();
     }
+}
+
+/// Chốt codec cho phiên: cái tốt nhất mà **cả hai đầu** làm được.
+///
+/// HEVC nén hơn H.264 khoảng 30% ở cùng chất lượng nên luôn ưu tiên, nhưng chỉ
+/// khi máy bên kia giải mã được — Windows mới cài không có bộ giải mã HEVC, và
+/// với những máy đó H.264 là đường duy nhất chạy được.
+fn pick_codec(viewer_codecs: &[Codec]) -> anyhow::Result<Codec> {
+    let mine = rd_codec::encodable();
+    [Codec::Hevc, Codec::H264]
+        .into_iter()
+        .find(|codec| mine.contains(codec) && viewer_codecs.contains(codec))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "hai máy không có codec chung: máy này mã hoá được {mine:?}, \
+                 máy kia giải mã được {viewer_codecs:?}"
+            )
+        })
 }
 
 /// Đưa frame vừa chụp vào bộ mã hoá.
@@ -318,7 +345,9 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn start(target_fps: u32, bitrate_kbps: u32, allow_10bit: bool) -> anyhow::Result<Self> {
-        let mut encoder = EncodeSource::start(target_fps, bitrate_kbps, allow_10bit)?;
+        // Người xem ở đây chính là máy này, nên khả năng giải mã cũng là của nó.
+        let mut encoder =
+            EncodeSource::start(target_fps, bitrate_kbps, allow_10bit, &rd_codec::decodable())?;
         let info = encoder.info().clone();
 
         #[cfg(target_os = "macos")]
@@ -456,9 +485,13 @@ fn open_source(config: CaptureConfig) -> anyhow::Result<(Source, String)> {
         Err(err) => {
             tracing::warn!(%err, "không mở được màn hình thật, dùng nguồn tổng hợp");
             let capturer = rd_capture::synthetic::SyntheticCapturer::start(config)?;
+            // Kèm nguyên văn lý do chứ không đoán "chưa có quyền": tên này đi
+            // thẳng lên bảng thông số của người xem, và họ là người duy nhất
+            // nhìn thấy chuyện gì đó không ổn — người ngồi ở máy host chỉ thấy
+            // phần mềm chạy bình thường.
             Ok((
                 Source::Synthetic(capturer),
-                "tổng hợp (chưa có quyền quay màn hình)".into(),
+                format!("tổng hợp — không mở được màn hình thật ({err})"),
             ))
         }
     }

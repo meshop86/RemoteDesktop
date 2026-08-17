@@ -35,13 +35,15 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFDXGIDeviceManager, IMFTransform, MF_VERSION, MFCreateDXGIDeviceManager,
-    MFSTARTUP_LITE, MFStartup, MFT_ENUM_FLAG, MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO,
-    MFTEnumEx,
+    MFMediaType_Video, MFSTARTUP_LITE, MFStartup, MFT_CATEGORY_VIDEO_DECODER,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO, MFTEnumEx,
+    MFVideoFormat_H264, MFVideoFormat_HEVC,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::core::Interface;
 
-use crate::{CodecError, Result};
+use crate::{Codec, CodecError, Result};
 
 /// Gói một lỗi HRESULT vào lỗi của ta, kèm tên việc đang làm.
 ///
@@ -76,11 +78,68 @@ pub(crate) fn ensure_started() -> Result<()> {
     }
 }
 
-/// Tìm và khởi tạo transform đầu tiên khớp yêu cầu.
+/// Mảng `IMFActivate` do Media Foundation cấp phát, tự dọn khi ra khỏi tầm.
 ///
-/// Media Foundation trả về một mảng `IMFActivate` do nó tự cấp phát, và việc
-/// dọn mảng đó có hai nửa dễ quên: nhả tham chiếu từng phần tử, rồi mới trả
-/// vùng nhớ. Gộp vào đây để cả bộ mã hoá lẫn bộ giải mã cùng dùng đúng một bản.
+/// Dọn có hai nửa dễ quên: nhả tham chiếu của *từng phần tử*, rồi mới trả vùng
+/// nhớ của mảng. Gói vào đây để cả bộ mã hoá, bộ giải mã lẫn phần dò khả năng
+/// máy cùng dùng đúng một bản.
+struct Activates {
+    ptr: *mut Option<IMFActivate>,
+    count: u32,
+}
+
+impl Activates {
+    fn enumerate(
+        category: windows::core::GUID,
+        flags: MFT_ENUM_FLAG,
+        input: Option<&MFT_REGISTER_TYPE_INFO>,
+        output: Option<&MFT_REGISTER_TYPE_INFO>,
+    ) -> Result<Self> {
+        let mut ptr: *mut Option<IMFActivate> = null_mut();
+        let mut count = 0u32;
+        unsafe {
+            MFTEnumEx(
+                category,
+                flags,
+                input.map(|info| info as *const _),
+                output.map(|info| info as *const _),
+                &mut ptr,
+                &mut count,
+            )
+        }
+        .map_err(|err| system("liệt kê transform", err))?;
+        // Không có phần tử nào thì con trỏ có thể null; `count` là nguồn sự thật.
+        if ptr.is_null() {
+            count = 0;
+        }
+        Ok(Self { ptr, count })
+    }
+
+    fn as_slice(&self) -> &[Option<IMFActivate>] {
+        if self.ptr.is_null() {
+            return &[];
+        }
+        // An toàn: Media Foundation vừa cấp mảng này với đúng `count` phần tử.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.count as usize) }
+    }
+}
+
+impl Drop for Activates {
+    fn drop(&mut self) {
+        if self.ptr.is_null() {
+            return;
+        }
+        for index in 0..self.count as usize {
+            // Đọc giá trị ra rồi thả chính là nhả tham chiếu mà `MFTEnumEx` đã
+            // tăng hộ ta. An toàn vì sau vòng này không ai đọc lại ô đó nữa —
+            // vùng nhớ được trả ngay bên dưới.
+            drop(unsafe { std::ptr::read(self.ptr.add(index)) });
+        }
+        unsafe { CoTaskMemFree(Some(self.ptr.cast())) };
+    }
+}
+
+/// Tìm và khởi tạo transform đầu tiên khớp yêu cầu.
 pub(crate) fn activate_first(
     category: windows::core::GUID,
     flags: MFT_ENUM_FLAG,
@@ -88,32 +147,14 @@ pub(crate) fn activate_first(
     output: Option<&MFT_REGISTER_TYPE_INFO>,
     what: &str,
 ) -> Result<IMFTransform> {
-    let mut activates: *mut Option<IMFActivate> = null_mut();
-    let mut count = 0u32;
-    unsafe {
-        MFTEnumEx(
-            category,
-            flags,
-            input.map(|info| info as *const _),
-            output.map(|info| info as *const _),
-            &mut activates,
-            &mut count,
-        )
-    }
-    .map_err(|err| system("liệt kê transform", err))?;
-
-    if activates.is_null() || count == 0 {
-        if !activates.is_null() {
-            unsafe { CoTaskMemFree(Some(activates.cast())) };
-        }
+    let activates = Activates::enumerate(category, flags, input, output)?;
+    if activates.count == 0 {
         return Err(CodecError::Unsupported(format!("máy này không có {what}")));
     }
 
-    // An toàn: Media Foundation vừa cấp mảng này với đúng `count` phần tử.
-    let list = unsafe { std::slice::from_raw_parts(activates, count as usize) };
     let mut created = None;
     let mut last_error = None;
-    for activate in list.iter().flatten() {
+    for activate in activates.as_slice().iter().flatten() {
         match unsafe { activate.ActivateObject::<IMFTransform>() } {
             Ok(transform) => {
                 created = Some(transform);
@@ -123,15 +164,91 @@ pub(crate) fn activate_first(
             Err(err) => last_error = Some(err),
         }
     }
-    for activate in list.iter().flatten() {
-        drop(activate.clone());
-    }
-    unsafe { CoTaskMemFree(Some(activates.cast())) };
 
     created.ok_or_else(|| match last_error {
         Some(err) => system("khởi tạo transform", err),
         None => CodecError::Unsupported(format!("không khởi tạo được {what}")),
     })
+}
+
+/// Có ít nhất một transform khớp yêu cầu hay không.
+///
+/// Chỉ đếm chứ không khởi tạo: đủ để trả lời "máy này giải mã được HEVC không"
+/// mà không đánh thức GPU hay giữ tài nguyên nào.
+fn has_transform(
+    category: windows::core::GUID,
+    flags: MFT_ENUM_FLAG,
+    input: Option<&MFT_REGISTER_TYPE_INFO>,
+    output: Option<&MFT_REGISTER_TYPE_INFO>,
+) -> bool {
+    Activates::enumerate(category, flags, input, output)
+        .map(|activates| activates.count > 0)
+        .unwrap_or(false)
+}
+
+fn subtype(codec: Codec) -> Option<windows::core::GUID> {
+    match codec {
+        Codec::H264 => Some(MFVideoFormat_H264),
+        Codec::Hevc => Some(MFVideoFormat_HEVC),
+        Codec::Av1 => None,
+    }
+}
+
+/// Codec mà máy này **giải mã** được.
+///
+/// Điều kiện dò phải trùng khít với điều kiện lúc dựng thật ở [`decoder`],
+/// không thì lời khai này thành lời hứa suông.
+///
+/// Windows **không** kèm sẵn bộ giải mã HEVC — nó nằm trong gói "HEVC Video
+/// Extensions" của Microsoft Store — nên một máy Windows mới cài thường chỉ trả
+/// về H.264.
+pub fn decodable() -> Vec<Codec> {
+    if ensure_started().is_err() {
+        return Vec::new();
+    }
+    [Codec::Hevc, Codec::H264]
+        .into_iter()
+        .filter(|codec| {
+            let Some(guid) = subtype(*codec) else {
+                return false;
+            };
+            let info = MFT_REGISTER_TYPE_INFO {
+                guidMajorType: MFMediaType_Video,
+                guidSubtype: guid,
+            };
+            has_transform(
+                MFT_CATEGORY_VIDEO_DECODER,
+                MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+                Some(&info),
+                None,
+            )
+        })
+        .collect()
+}
+
+/// Codec mà máy này **mã hoá** được bằng phần cứng.
+pub fn encodable() -> Vec<Codec> {
+    if ensure_started().is_err() {
+        return Vec::new();
+    }
+    [Codec::Hevc, Codec::H264]
+        .into_iter()
+        .filter(|codec| {
+            let Some(guid) = subtype(*codec) else {
+                return false;
+            };
+            let info = MFT_REGISTER_TYPE_INFO {
+                guidMajorType: MFMediaType_Video,
+                guidSubtype: guid,
+            };
+            has_transform(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                None,
+                Some(&info),
+            )
+        })
+        .collect()
 }
 
 /// Mở một device D3D11 dùng được cho Media Foundation.

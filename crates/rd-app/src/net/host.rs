@@ -295,7 +295,7 @@ async fn serve(
     let hello = tokio::time::timeout(HANDSHAKE_TIMEOUT, rx.recv())
         .await
         .map_err(|_| anyhow::anyhow!("viewer không chào trong {HANDSHAKE_TIMEOUT:?}"))??;
-    let (viewer_name, wants_10bit) = match check_hello(ctx, hello) {
+    let hello = match check_hello(ctx, hello) {
         Ok(hello) => hello,
         Err(err) => {
             // Nói rõ lý do rồi mới đóng: viewer gõ sai mật khẩu phải thấy được
@@ -316,9 +316,15 @@ async fn serve(
     let bitrate = Arc::new(AtomicU32::new(0));
     // Chỉ dùng 4:2:2 10-bit khi *cả hai* đầu làm được: bên này mã hoá được và
     // bên kia dựng hình được.
-    let allow_10bit = ctx.config.allow_10bit && wants_10bit;
-    let (info, mut encoded_rx) =
-        start_encoder(ctx, allow_10bit, keyframe.clone(), bitrate.clone()).await?;
+    let allow_10bit = ctx.config.allow_10bit && hello.wants_10bit;
+    let (info, mut encoded_rx) = start_encoder(
+        ctx,
+        allow_10bit,
+        hello.codecs,
+        keyframe.clone(),
+        bitrate.clone(),
+    )
+    .await?;
 
     tx.send(&HostEvent::Welcome {
         version: rd_protocol::PROTOCOL_VERSION,
@@ -346,7 +352,7 @@ async fn serve(
 
     ctx.events.send(NetEvent::Connected {
         peer: session.remote_address(),
-        name: viewer_name,
+        name: hello.viewer_name,
         relayed,
     });
     ctx.events.send(NetEvent::Info(Box::new(info.clone())));
@@ -379,13 +385,21 @@ async fn serve(
     }
 }
 
-/// Kiểm tra lời chào. Trả về tên viewer và khả năng 10-bit của nó nếu hợp lệ.
-fn check_hello(ctx: &Arc<Context>, hello: ViewerCommand) -> anyhow::Result<(String, bool)> {
+/// Những gì host cần biết về viewer trước khi dựng chuỗi mã hoá.
+struct Hello {
+    viewer_name: String,
+    wants_10bit: bool,
+    codecs: Vec<rd_protocol::control::Codec>,
+}
+
+/// Kiểm tra lời chào, trả về phần dùng được nếu hợp lệ.
+fn check_hello(ctx: &Arc<Context>, hello: ViewerCommand) -> anyhow::Result<Hello> {
     let ViewerCommand::Hello {
         version,
         viewer_name,
         auth,
         wants_10bit,
+        codecs,
     } = hello
     else {
         anyhow::bail!("viewer gửi sai thứ tự, mong đợi Hello");
@@ -402,7 +416,11 @@ fn check_hello(ctx: &Arc<Context>, hello: ViewerCommand) -> anyhow::Result<(Stri
     if auth != ctx.auth() {
         anyhow::bail!("sai mật khẩu phiên");
     }
-    Ok((viewer_name, wants_10bit))
+    Ok(Hello {
+        viewer_name,
+        wants_10bit,
+        codecs,
+    })
 }
 
 /// Khởi động chụp + mã hoá trên luồng riêng.
@@ -413,6 +431,7 @@ fn check_hello(ctx: &Arc<Context>, hello: ViewerCommand) -> anyhow::Result<(Stri
 async fn start_encoder(
     ctx: &Arc<Context>,
     allow_10bit: bool,
+    viewer_codecs: Vec<rd_protocol::control::Codec>,
     keyframe: Arc<AtomicBool>,
     bitrate: Arc<AtomicU32>,
 ) -> anyhow::Result<(PipelineInfo, tokio::sync::mpsc::Receiver<EncodedFrame>)> {
@@ -425,7 +444,12 @@ async fn start_encoder(
     std::thread::Builder::new()
         .name("rd-encode".into())
         .spawn(move || {
-            let mut source = match EncodeSource::start(target_fps, bitrate_kbps, allow_10bit) {
+            let mut source = match EncodeSource::start(
+                target_fps,
+                bitrate_kbps,
+                allow_10bit,
+                &viewer_codecs,
+            ) {
                 Ok(source) => source,
                 Err(err) => {
                     let _ = ready_tx.send(Err(err));

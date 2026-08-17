@@ -94,6 +94,7 @@ async fn video_over_loopback_keeps_frames_intact_and_fast() {
         viewer_name: "test-viewer".into(),
         auth: [0u8; 32],
         wants_10bit: false,
+        codecs: vec![rd_protocol::control::Codec::H264],
     })
     .await
     .unwrap();

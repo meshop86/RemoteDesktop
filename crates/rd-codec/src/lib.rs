@@ -37,6 +37,37 @@ pub use mediafoundation::{MfDecoder as PlatformDecoder, MfEncoder as PlatformEnc
 
 pub use rd_protocol::control::{ChromaSubsampling, Codec};
 
+/// Codec mà máy này **giải mã** được, xếp theo thứ tự ưu tiên.
+///
+/// Viewer khai danh sách này trong lời chào, host chỉ được mã hoá bằng codec
+/// nằm trong đó. Đoán bừa là hỏng theo kiểu khó hiểu nhất: phiên nối xong, báo
+/// thành công, rồi tắt ngay vì không dựng nổi bộ giải mã — không hình, không
+/// điều khiển được, mà nhìn bề ngoài thì mọi thứ đều ổn.
+#[cfg(target_os = "windows")]
+pub fn decodable() -> Vec<Codec> {
+    mediafoundation::decodable()
+}
+
+/// Codec mà máy này **mã hoá** được.
+#[cfg(target_os = "windows")]
+pub fn encodable() -> Vec<Codec> {
+    mediafoundation::encodable()
+}
+
+/// Mọi máy Mac chạy được bản này đều giải mã được cả hai codec: HEVC có mặt từ
+/// macOS 10.13, và VideoToolbox tự lùi về giải mã bằng phần mềm ở những máy
+/// không có mạch phần cứng. Không có API nào hỏi được "dựng nổi phiên không" mà
+/// không dựng thử, nên khai thẳng còn hơn dựng thử rồi vứt.
+#[cfg(target_os = "macos")]
+pub fn decodable() -> Vec<Codec> {
+    vec![Codec::Hevc, Codec::H264]
+}
+
+#[cfg(target_os = "macos")]
+pub fn encodable() -> Vec<Codec> {
+    vec![Codec::Hevc, Codec::H264]
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
     #[error("phần cứng không hỗ trợ cấu hình này ({0})")]

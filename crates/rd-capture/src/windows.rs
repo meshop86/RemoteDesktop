@@ -300,8 +300,13 @@ impl ScreenCapturer for WgcScreenCapturer {
         }
 
         let index = config.display_id as usize;
-        let monitor =
-            Monitor::from_index(index).map_err(|_| CaptureError::DisplayNotFound(config.display_id))?;
+        // `from_index` của windows-capture đếm từ **1**, còn `display_id` của ta
+        // đếm từ 0 cho khớp chỉ số trong danh sách `list_displays` trả về. Quên
+        // cộng 1 thì màn hình mặc định (id 0) không bao giờ mở được, mà lỗi đó
+        // không nổ ra ở đâu cả: chuỗi mã hoá lặng lẽ lùi về nguồn tổng hợp và
+        // người xem ngồi nhìn hình giả, tưởng phần mềm chạy đúng.
+        let monitor = Monitor::from_index(index + 1)
+            .map_err(|_| CaptureError::DisplayNotFound(config.display_id))?;
         let display = describe(&monitor, index, config.target_fps);
 
         if let Some(limit) = config.max_dimension {
