@@ -1,0 +1,58 @@
+name: Smoke Windows
+
+# Chạy thật file exe trên một máy Windows sạch. CI thường chỉ build và chạy
+# test — mà "cài xong bấm vào không lên gì" là loại lỗi chỉ lộ ra khi có ai đó
+# bấm vào thật.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cài Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-latest-smoke-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-latest-smoke-
+
+      - name: Build
+        run: cargo build --release -p rd-app
+
+      - name: Chạy --help
+        run: |
+          $out = & .\target\release\remote-desktop.exe --help 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "--help thoát với mã $LASTEXITCODE" }
+          if (-not $out.Contains("remote-desktop")) { throw "--help không in ra gì: $out" }
+          $out
+
+      - name: Mở giao diện 25 giây
+        run: |
+          $proc = Start-Process .\target\release\remote-desktop.exe -PassThru
+          Start-Sleep -Seconds 25
+          if ($proc.HasExited) {
+            throw "giao diện chết sau khi mở, mã thoát $($proc.ExitCode)"
+          }
+          "tiến trình vẫn sống sau 25 giây"
+          Stop-Process -Id $proc.Id -Force
+
+      # Đọc dù bước trên có đỏ hay không — chết ở đâu thì nhật ký nói ở đó.
+      - name: Nhật ký
+        if: always()
+        run: |
+          $log = "$env:LOCALAPPDATA\RemoteDesktop\rd.log"
+          if (Test-Path $log) { Get-Content $log } else { "không có file nhật ký tại $log" }
