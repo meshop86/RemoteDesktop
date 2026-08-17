@@ -27,9 +27,11 @@ jobs:
 
       - name: Lấy số phiên bản
         id: version
-        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        # Tên biến phải khác GITHUB_*: những biến ấy do runner đặt, workflow ghi
+        # đè không ăn — chạy tay mà đặt tên file là "main" là vì thế.
+        run: echo "value=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
         env:
-          GITHUB_REF_NAME: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
+          REF_NAME: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
 
       # Bản universal: một file chạy được cả trên máy Apple Silicon lẫn Intel.
       - name: Đóng gói
@@ -56,9 +58,11 @@ jobs:
       - name: Lấy số phiên bản
         id: version
         shell: bash
-        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        # Tên biến phải khác GITHUB_*: những biến ấy do runner đặt, workflow ghi
+        # đè không ăn — chạy tay mà đặt tên file là "main" là vì thế.
+        run: echo "value=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
         env:
-          GITHUB_REF_NAME: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
+          REF_NAME: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
 
       - name: Build
         run: cargo build --release -p rd-app -p rd-signal
@@ -121,6 +125,18 @@ jobs:
         with:
           path: dist
 
+      # Mã băm để người tải về đối chiếu, và để tra trên VirusTotal mà không phải
+      # tự tay đăng file lên đó.
+      - name: Ghi mã băm
+        run: |
+          {
+            echo '## SHA-256'
+            echo
+            echo '```'
+            (cd dist && sha256sum macos/* windows/* | sed 's#[a-z]*/##')
+            echo '```'
+          } > notes.md
+
       - name: Tạo bản phát hành
         env:
           GH_TOKEN: ${{ github.token }}
@@ -128,5 +144,6 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md \
             --generate-notes \
             dist/macos/* dist/windows/*

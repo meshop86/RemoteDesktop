@@ -32,6 +32,23 @@ Tải ở mục [Releases](../../releases).
 - **Windows**: chạy `RemoteDesktop-x.y.z-windows-setup.exe`, hoặc giải nén bản
   `.zip` rồi chạy thẳng `remote-desktop.exe`.
 
+### Windows báo "Windows protected your PC"
+
+Bản phát hành chưa mua chứng chỉ ký mã (code signing), nên SmartScreen chặn ở
+lần chạy đầu: bấm **More info** → **Run anyway**. Đây là cảnh báo về danh tính
+người phát hành, không phải kết quả quét virus.
+
+Nếu Windows Defender báo hẳn một tên mã độc (`Trojan:Win32/Wacatac`,
+`Program:Win32/Wacapew`... ) thì gần như chắc là báo nhầm: chương trình chụp
+màn hình, giả lập chuột phím và mở kết nối ra Internet — đúng những việc mà
+phần mềm gián điệp cũng làm, nên bộ quét đoán mò theo hành vi. Cách kiểm tra là
+đối chiếu mã băm SHA-256 của file tải về với mã ghi trong trang Releases, rồi
+tra mã đó trên VirusTotal:
+
+```powershell
+Get-FileHash .\RemoteDesktop-x.y.z-windows-setup.exe -Algorithm SHA256
+```
+
 ### Quyền trên macOS
 
 Máy **chia sẻ màn hình** phải được cấp hai quyền, nếu không chương trình vẫn
