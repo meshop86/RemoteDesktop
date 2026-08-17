@@ -26,6 +26,52 @@ use rd_viewer::pipeline::PipelineInfo;
 use crate::net::{NetConfig, NetEvent, NetHandle, Role, UiCommand};
 use crate::ui;
 
+/// Một địa chỉ đọc được cho người kia gõ vào.
+struct Address {
+    /// Đường nào: mạng nhà, hay qua Tailscale.
+    label: &'static str,
+    value: String,
+}
+
+/// Địa chỉ IPv4 của máy này trong mạng nội bộ.
+///
+/// std không có cách nào liệt kê card mạng, nên hỏi ngược hệ điều hành: mở một
+/// socket UDP rồi "nối" tới một địa chỉ ngoài internet. UDP không bắt tay nên
+/// không một gói tin nào rời khỏi máy — hệ điều hành chỉ tra bảng định tuyến,
+/// chọn card mạng sẽ dùng để đi ra, rồi gán địa chỉ nguồn. Đọc lại địa chỉ đó
+/// là xong, và nó đúng là địa chỉ mà máy bên kia trong cùng mạng gõ vào được.
+///
+/// Máy nối nhiều mạng cùng lúc (vừa Wi-Fi vừa dây) thì cách này cho ra đường
+/// mặc định, tức đường mà máy kia nhiều khả năng cũng đang ở.
+pub fn lan_ip() -> Option<std::net::Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    // Không có đường ra internet thì `connect` trả lỗi và ta đành chịu — thà
+    // không hiện gì còn hơn hiện một địa chỉ sai.
+    socket.connect(("1.1.1.1", 53)).ok()?;
+    match socket.local_addr().ok()? {
+        std::net::SocketAddr::V4(addr) => Some(*addr.ip()),
+        std::net::SocketAddr::V6(_) => None,
+    }
+}
+
+/// Những địa chỉ máy kia gõ vào được để tới máy này.
+fn host_addresses(port: u16, tailscale_ip: Option<String>) -> Vec<Address> {
+    let mut out = Vec::new();
+    if let Some(ip) = lan_ip() {
+        out.push(Address {
+            label: "trong mạng nhà",
+            value: format!("{ip}:{port}"),
+        });
+    }
+    if let Some(ip) = tailscale_ip {
+        out.push(Address {
+            label: "qua Tailscale, ở mạng nào cũng được",
+            value: format!("{ip}:{port}"),
+        });
+    }
+    out
+}
+
 /// Bật/tắt HUD. Trùng với phím tắt của chế độ thử tại chỗ để khỏi phải nhớ hai
 /// phím cho cùng một việc.
 const HUD_KEY: egui::Key = egui::Key::F10;
@@ -234,6 +280,8 @@ pub struct SessionState {
 
     status: String,
     code: Option<PeerId>,
+    /// Địa chỉ để đọc cho người kia — chỉ có ở vai host.
+    addresses: Vec<Address>,
     peer: Option<String>,
     relayed: bool,
     link: Option<LinkStats>,
@@ -252,11 +300,17 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    pub fn start(config: NetConfig) -> anyhow::Result<Self> {
+    /// `tailscale_ip` là địa chỉ tailnet của máy này, nếu Tailscale đang chạy.
+    /// Lấy sẵn ở màn hình đầu rồi truyền vào, vì hỏi Tailscale là lời gọi chặn.
+    pub fn start(config: NetConfig, tailscale_ip: Option<String>) -> anyhow::Result<Self> {
         let role = config.role;
         let my_name = config.name.clone();
         let password = config.password.clone();
         let bitrate_kbps = config.bitrate_kbps;
+        let addresses = match role {
+            Role::Host => host_addresses(config.bind.port(), tailscale_ip),
+            Role::Viewer => Vec::new(),
+        };
         let net = NetHandle::spawn(config)?;
         Ok(Self {
             role,
@@ -271,6 +325,7 @@ impl SessionState {
             transfers: Transfers::default(),
             status: "đang khởi động".into(),
             code: None,
+            addresses,
             peer: None,
             relayed: false,
             link: None,
@@ -619,6 +674,25 @@ impl SessionState {
                             );
                         }
                     }
+
+                    // Địa chỉ ngay đây thì khỏi phải đi lục trong cài đặt mạng
+                    // của hệ điều hành mới biết đọc gì cho người kia gõ.
+                    for address in &self.addresses {
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(12.0);
+                        ui.label(format!("Địa chỉ {}:", address.label));
+                        ui.label(
+                            egui::RichText::new(&address.value)
+                                .monospace()
+                                .size(22.0)
+                                .strong(),
+                        );
+                        if ui.button("Chép địa chỉ").clicked() {
+                            ui.ctx().copy_text(address.value.clone());
+                        }
+                    }
+
                     ui.add_space(12.0);
                     ui.separator();
                     ui.add_space(12.0);

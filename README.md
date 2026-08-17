@@ -104,8 +104,9 @@ remote-desktop --host --password 123456
 remote-desktop --connect 192.168.1.20:47823 --password 123456
 ```
 
-Máy chia sẻ hiện **mã 9 chữ số** và **mật khẩu phiên**; đọc cho người bên kia
-gõ vào là xong. Trong cùng mạng LAN thì gõ thẳng `IP:47823` cũng được.
+Máy chia sẻ hiện **mã 9 chữ số**, **mật khẩu phiên** và **địa chỉ IP của chính
+nó** (cả địa chỉ trong mạng nhà lẫn địa chỉ Tailscale nếu có) — đọc cho người
+bên kia gõ vào là xong, khỏi phải đi lục trong cài đặt mạng.
 
 Phím tắt khi đang xem: `F9` bật/tắt điều khiển, `F8` ẩn/hiện bảng chat và tệp,
 `F10` ẩn/hiện thông số. Gửi tệp bằng cách kéo thả vào cửa sổ.

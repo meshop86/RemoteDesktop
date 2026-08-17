@@ -260,6 +260,16 @@ pub fn probe() -> String {
         );
     }
 
+    let _ = writeln!(out, "\nMạng:");
+    match crate::session::lan_ip() {
+        Some(ip) => {
+            let _ = writeln!(out, "  địa chỉ trong mạng nhà: {ip}:{DEFAULT_PORT}");
+        }
+        None => {
+            let _ = writeln!(out, "  không xác định được địa chỉ trong mạng nhà");
+        }
+    }
+
     let _ = writeln!(out, "\nTailscale:");
     for line in crate::tailscale::describe().lines() {
         let _ = writeln!(out, "  {line}");
@@ -389,7 +399,11 @@ impl RdApp {
             self.error = Some(format!("không tạo được thư mục nhận tệp: {err}"));
             return;
         }
-        match SessionState::start(config) {
+        // Địa chỉ tailnet chỉ có nghĩa khi Tailscale đang chạy; đưa sẵn cho
+        // phiên để thẻ host đọc luôn được cả hai đường.
+        let snapshot = self.tailscale.snapshot();
+        let tailscale_ip = snapshot.running().then_some(snapshot.self_ip).flatten();
+        match SessionState::start(config, tailscale_ip) {
             Ok(state) => {
                 self.error = None;
                 self.screen = Screen::Session(Box::new(state));
