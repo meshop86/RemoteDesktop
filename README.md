@@ -49,6 +49,20 @@ tra mã đó trên VirusTotal:
 Get-FileHash .\RemoteDesktop-x.y.z-windows-setup.exe -Algorithm SHA256
 ```
 
+### Cài xong bấm vào không lên gì
+
+Từ bản 0.1.4, mọi lỗi lúc khởi động đều hiện thành hộp thoại và được ghi lại.
+Nếu cửa sổ chương trình không mở, mở file nhật ký lên đọc dòng cuối:
+
+```powershell
+notepad $env:LOCALAPPDATA\RemoteDesktop\rd.log
+```
+
+Nguyên nhân hay gặp nhất là trình điều khiển card màn hình quá cũ hoặc chưa cài
+— trong nhật ký sẽ có dòng `thấy card màn hình` liệt kê từng card mà chương
+trình nhìn thấy. Không có dòng nào nghĩa là Windows không đưa ra card nào dùng
+được; cập nhật driver rồi chạy lại.
+
 ### Quyền trên macOS
 
 Máy **chia sẻ màn hình** phải được cấp hai quyền, nếu không chương trình vẫn

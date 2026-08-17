@@ -274,11 +274,25 @@ fn device_setup() -> eframe::egui_wgpu::WgpuSetup {
         other => return other,
     };
     setup.native_adapter_selector = Some(Arc::new(chon_card));
-    setup.device_descriptor = Arc::new(|adapter: &wgpu::Adapter| wgpu::DeviceDescriptor {
-        label: Some("remote-desktop"),
-        required_features: rd_viewer::video::NEEDED_FOR_10BIT & adapter.features(),
-        required_limits: wgpu::Limits::default(),
-        ..Default::default()
+    setup.device_descriptor = Arc::new(|adapter: &wgpu::Adapter| {
+        // Máy không có driver DirectX còn dùng được thì wgpu lùi về OpenGL, mà
+        // ở đó hạn mức mặc định của WebGPU là quá tầm — đòi bằng được thì không
+        // tạo nổi thiết bị và cửa sổ không mở lên. Cùng cách chọn của egui.
+        let base = if adapter.get_info().backend == wgpu::Backend::Gl {
+            wgpu::Limits::downlevel_webgl2_defaults()
+        } else {
+            wgpu::Limits::default()
+        };
+        wgpu::DeviceDescriptor {
+            label: Some("remote-desktop"),
+            required_features: rd_viewer::video::NEEDED_FOR_10BIT & adapter.features(),
+            required_limits: wgpu::Limits {
+                // Đủ cho màn hình 4K và cho khung hình nhận về.
+                max_texture_dimension_2d: 8192,
+                ..base
+            },
+            ..Default::default()
+        }
     });
     eframe::egui_wgpu::WgpuSetup::CreateNew(setup)
 }
