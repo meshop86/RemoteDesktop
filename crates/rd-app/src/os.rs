@@ -133,10 +133,31 @@ impl FilePicker {
         self.picked.is_some()
     }
 
-    /// Mở hộp thoại. Không làm gì nếu đang có một cái mở rồi: hai hộp thoại
-    /// chồng nhau thì cái sau che cái trước và người dùng không hiểu vì sao
-    /// bấm xong lại hiện tiếp một cái nữa.
+    /// Chọn tệp để gửi — chọn được nhiều cái một lúc.
     pub fn open(&mut self) {
+        self.spawn(|| {
+            rfd::FileDialog::new()
+                .set_title("Chọn tệp để gửi sang máy kia")
+                .pick_files()
+                .unwrap_or_default()
+        });
+    }
+
+    /// Chọn thư mục — dùng cho ô "thư mục nhận tệp".
+    pub fn open_folder(&mut self) {
+        self.spawn(|| {
+            rfd::FileDialog::new()
+                .set_title("Chọn thư mục lưu tệp nhận được")
+                .pick_folder()
+                .into_iter()
+                .collect()
+        });
+    }
+
+    /// Không làm gì nếu đang có một hộp thoại mở rồi: hai cái chồng nhau thì
+    /// cái sau che cái trước, và người dùng không hiểu vì sao bấm xong lại hiện
+    /// tiếp một cái nữa.
+    fn spawn(&mut self, pick: impl FnOnce() -> Vec<PathBuf> + Send + 'static) {
         if self.busy() {
             return;
         }
@@ -144,15 +165,11 @@ impl FilePicker {
         let spawned = std::thread::Builder::new()
             .name("rd-picker".into())
             .spawn(move || {
-                let paths = rfd::FileDialog::new()
-                    .set_title("Chọn tệp để gửi sang máy kia")
-                    .pick_files()
-                    .unwrap_or_default();
-                let _ = tx.send(paths);
+                let _ = tx.send(pick());
             });
         match spawned {
             Ok(_) => self.picked = Some(rx),
-            Err(err) => tracing::warn!(%err, "không mở được hộp thoại chọn tệp"),
+            Err(err) => tracing::warn!(%err, "không mở được hộp thoại chọn"),
         }
     }
 

@@ -355,6 +355,8 @@ pub struct RdApp {
     can_10bit: bool,
     /// Trạng thái Tailscale, hỏi trên luồng nền (xem `crate::tailscale`).
     tailscale: crate::tailscale::Watcher,
+    /// Hộp thoại chọn thư mục nhận tệp, khi người dùng bấm nút cạnh ô đó.
+    picker: crate::os::FilePicker,
     error: Option<String>,
 }
 
@@ -374,6 +376,7 @@ impl RdApp {
             form,
             can_10bit,
             tailscale: crate::tailscale::Watcher::new(),
+            picker: crate::os::FilePicker::default(),
             error: None,
         };
 
@@ -593,7 +596,13 @@ impl RdApp {
                     ui.end_row();
 
                     ui.label("Thư mục nhận tệp");
-                    ui.text_edit_singleline(&mut self.form.downloads);
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.form.downloads);
+                        let button = egui::Button::new("Chọn…");
+                        if ui.add_enabled(!self.picker.busy(), button).clicked() {
+                            self.picker.open_folder();
+                        }
+                    });
                     ui.end_row();
 
                     ui.label("Chất lượng");
@@ -693,6 +702,11 @@ impl eframe::App for RdApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let leave = match &mut self.screen {
             Screen::Start => {
+                // Hộp thoại chọn thư mục nằm ở luồng khác nên kết quả về lúc
+                // nào không biết trước; hỏi mỗi lượt vẽ.
+                if let Some(dir) = self.picker.take().into_iter().next() {
+                    self.form.downloads = dir.display().to_string();
+                }
                 self.draw_start(ui);
                 false
             }
