@@ -54,6 +54,10 @@ use super::{ensure_started, system};
 /// luôn vuông; không khai thì vài bộ mã hoá tự suy ra tỉ lệ của TV analog.
 const SQUARE_PIXELS: u64 = attribute_pair(1, 1);
 
+/// Số frame tối đa được nằm chờ vé `NeedInput`. Đủ để lấp ống dẫn của MFT phần
+/// cứng, không đủ để một MFT đã kẹt ăn hết VRAM.
+const MAX_PENDING: usize = 4;
+
 #[derive(Default)]
 struct Counters {
     submitted: AtomicU64,
@@ -251,6 +255,16 @@ impl MfEncoder {
         let mut pipeline = self.shared.lock();
         pipeline.submitted_at.insert(job.pts, Instant::now());
         pipeline.pending.push_back(job);
+        // MFT không mời nhận nữa (driver kẹt, phiên đăng nhập bị khoá) thì hàng
+        // chờ này phình ra vô hạn, mà mỗi chỗ trong hàng là một texture trong
+        // VRAM. Bỏ frame cũ nhất: với hình trực tiếp thì frame cũ vốn đã hết giá
+        // trị, giữ lại chỉ để hết bộ nhớ.
+        while pipeline.pending.len() > MAX_PENDING {
+            if let Some(stale) = pipeline.pending.pop_front() {
+                pipeline.submitted_at.remove(&stale.pts);
+                self.shared.counters.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         self.shared.counters.submitted.fetch_add(1, Ordering::Relaxed);
         pipeline.feed(&self.shared.counters);
         Ok(())

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rd_capture::{CaptureConfig, ScreenCapturer};
 use rd_codec::{
@@ -73,6 +73,24 @@ pub struct PipelineCounters {
 
 // ─────────────────────────── nửa của máy host ───────────────────────────
 
+/// Màn hình đứng yên bao lâu thì nộp lại frame cũ cho bộ mã hoá.
+///
+/// Windows Graphics Capture chỉ giao frame khi màn hình *đổi*, nên một màn hình
+/// đứng yên không sinh ra frame nào cả. Không nộp lại thì ống dẫn của MFT phần
+/// cứng — vốn nuốt vài frame rồi mới nhả frame đầu — không bao giờ chảy, và
+/// người vừa vào phiên ngồi nhìn màn hình đen mãi. Frame lặp lại nén còn vài
+/// trăm byte nên nhịp này gần như không tốn băng thông, đổi lại nó cũng là
+/// đường hồi phục khi mất gói.
+const IDLE_REPEAT: Duration = Duration::from_millis(200);
+
+/// Chờ frame mới từ màn hình tối đa bấy nhiêu trong một vòng.
+///
+/// Ngắn hơn [`IDLE_REPEAT`] nhiều lần, và cố ý: nằm chờ màn hình lâu quá thì
+/// frame *đã nén xong* nằm chờ theo trong bộ mã hoá. Chia nhỏ ra thì vòng lặp
+/// quay lại lấy nó sau vài mili giây, đúng lúc hình vừa ngừng động — chỗ mà độ
+/// trễ dễ thấy nhất.
+const CAPTURE_SLICE: Duration = Duration::from_millis(8);
+
 /// Nguồn frame đã nén: chụp màn hình rồi mã hoá ngay, không qua CPU.
 pub struct EncodeSource {
     source: Source,
@@ -81,6 +99,9 @@ pub struct EncodeSource {
     /// Frame đầu tiên đã phải chụp ngay lúc dựng (để biết phân giải, và trên
     /// Windows là để mượn device D3D11), nên nó chờ ở đây cho lượt lấy đầu.
     pending: Option<rd_capture::CapturedFrame>,
+    /// Frame vừa nộp gần nhất, giữ lại để nộp lần nữa khi màn hình đứng yên.
+    last: Option<rd_capture::CapturedFrame>,
+    last_submit: Instant,
     /// Giữ device của capture để bộ giải mã cùng máy dùng lại được — trộn hai
     /// device là phải chép texture qua RAM ở giữa.
     #[cfg(target_os = "windows")]
@@ -145,6 +166,8 @@ impl EncodeSource {
             encoder,
             info,
             pending: Some(first),
+            last: None,
+            last_submit: Instant::now(),
             #[cfg(target_os = "windows")]
             device,
         })
@@ -170,19 +193,62 @@ impl EncodeSource {
 
     /// Chụp một frame rồi mã hoá.
     ///
-    /// `Ok(None)` nghĩa là trong khoảng chờ không có frame mới — màn hình đứng
-    /// yên, chuyện bình thường và không tốn gì. Chỉ `Err` mới là hỏng.
+    /// `Ok(None)` nghĩa là chưa có gì để gửi ở lượt này — màn hình đứng yên,
+    /// hoặc bộ mã hoá còn đang giữ frame trong ống dẫn. Cả hai đều bình thường
+    /// và không tốn gì; chỉ `Err` mới là hỏng.
+    ///
+    /// Điểm mấu chốt: **không** ghép một frame vào bằng một frame ra. MFT phần
+    /// cứng nuốt vài frame rồi mới nhả frame đầu tiên, có lúc lại nhả hai frame
+    /// liền một nhịp. Đòi đúng một frame ra sau mỗi frame vào là tự treo mình ở
+    /// những nhịp nó chưa kịp nhả — và đó chính là lỗi khiến máy host báo "dừng
+    /// chụp màn hình: hết thời gian chờ" trong khi bộ mã hoá vẫn khoẻ.
     pub fn next_encoded(&mut self, timeout: Duration) -> anyhow::Result<Option<EncodedFrame>> {
-        let captured = match self.pending.take() {
-            Some(frame) => frame,
-            None => match self.source.next_frame(timeout) {
-                Ok(frame) => frame,
-                Err(rd_capture::CaptureError::Timeout) => return Ok(None),
+        // Frame đã nén đang chờ sẵn thì lấy ngay, khỏi bắt nó già thêm một nhịp.
+        if let Some(frame) = self.encoder.try_next_frame() {
+            return Ok(Some(frame));
+        }
+
+        let wait = timeout.min(CAPTURE_SLICE);
+        let fresh = match self.pending.take() {
+            Some(frame) => Some(frame),
+            None => match self.source.next_frame(wait) {
+                Ok(frame) => Some(frame),
+                Err(rd_capture::CaptureError::Timeout) => None,
                 Err(err) => return Err(err.into()),
             },
         };
-        submit(&mut self.encoder, &captured)?;
-        Ok(Some(self.encoder.next_frame(Duration::from_millis(500))?))
+
+        match fresh {
+            Some(frame) => {
+                let pts_us = frame.capture_us;
+                self.feed(frame, pts_us)?;
+            }
+            None if self.last_submit.elapsed() >= IDLE_REPEAT => {
+                // Nộp lại frame cũ với mốc thời gian mới: MFT bỏ sample có
+                // timestamp không tăng, và mốc cũ còn làm số đo độ trễ ở viewer
+                // thành sai lệch bằng đúng tuổi của frame.
+                if let Some(frame) = self.last.take() {
+                    self.feed(frame, now_us())?;
+                }
+            }
+            None => {}
+        }
+
+        // Chờ có hạn: đủ để frame vừa nộp kịp ra trong nhịp này, không đủ lâu để
+        // khoá vòng lặp khi ống dẫn còn đang lấp.
+        match self.encoder.next_frame(Duration::from_millis(20)) {
+            Ok(frame) => Ok(Some(frame)),
+            Err(rd_codec::CodecError::Timeout) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Đưa frame vào bộ mã hoá rồi giữ lại cho lượt nộp lặp.
+    fn feed(&mut self, frame: rd_capture::CapturedFrame, pts_us: u64) -> anyhow::Result<()> {
+        submit(&mut self.encoder, &frame, pts_us)?;
+        self.last = Some(frame);
+        self.last_submit = Instant::now();
+        Ok(())
     }
 
     pub fn stop(&mut self) {
@@ -210,22 +276,26 @@ fn pick_codec(viewer_codecs: &[Codec]) -> anyhow::Result<Codec> {
 
 /// Đưa frame vừa chụp vào bộ mã hoá.
 ///
-/// Dùng thẳng thời điểm chụp làm timestamp: nó đi xuyên qua bộ mã hoá và quay
-/// ra ở bộ giải mã, nên trừ đi là được độ trễ của cả chuỗi.
+/// `pts_us` thường là thời điểm chụp: nó đi xuyên qua bộ mã hoá và quay ra ở bộ
+/// giải mã, nên trừ đi là được độ trễ của cả chuỗi. Chỉ khác ở frame nộp lặp —
+/// xem [`IDLE_REPEAT`] — vì frame đó mang mốc cũ thì độ trễ đo ra là tuổi của
+/// tấm hình chứ không phải thời gian nó đi hết chuỗi.
 #[cfg(target_os = "macos")]
 fn submit(
     encoder: &mut PlatformEncoder,
     captured: &rd_capture::CapturedFrame,
+    pts_us: u64,
 ) -> rd_codec::Result<()> {
-    encoder.submit(captured.surface.as_pixel_buffer(), captured.capture_us)
+    encoder.submit(captured.surface.as_pixel_buffer(), pts_us)
 }
 
 #[cfg(target_os = "windows")]
 fn submit(
     encoder: &mut PlatformEncoder,
     captured: &rd_capture::CapturedFrame,
+    pts_us: u64,
 ) -> rd_codec::Result<()> {
-    encoder.submit(captured.surface.texture(), captured.capture_us)
+    encoder.submit(captured.surface.texture(), pts_us)
 }
 
 // ────────────────────────── nửa của máy viewer ──────────────────────────

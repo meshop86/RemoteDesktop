@@ -582,8 +582,22 @@ impl SessionState {
         };
 
         let rect = ui::video_rect(outer, info.width, info.height);
-        if let Some(frame) = &self.current {
-            ui::draw_video(ui, rect, frame);
+        match &self.current {
+            Some(frame) => ui::draw_video(ui, rect, frame),
+            // Nối được nhưng chưa có hình thì phải nói ra. Để trống là màn hình
+            // đen y hệt lúc hỏng, và người dùng không có cách nào phân biệt
+            // "đang chờ" với "chuỗi chụp bên kia đã chết".
+            None => {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(outer), |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new("Đã nối — đang chờ hình từ máy kia…")
+                                .size(16.0)
+                                .color(ui::WARN),
+                        );
+                    });
+                });
+            }
         }
 
         // Ô nhận input phải trùng đúng ô video: bấm vào viền đen mà vẫn tính

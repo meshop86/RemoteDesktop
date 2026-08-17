@@ -40,6 +40,19 @@ const SIGNAL_PING: Duration = Duration::from_secs(10);
 /// Chờ bao lâu trước khi thử nối lại rendezvous server sau khi đứt.
 const SIGNAL_RETRY: Duration = Duration::from_secs(3);
 
+/// Không lấy được frame nào lâu tới mức này thì coi như chuỗi chụp đã tắc.
+///
+/// Màn hình đứng yên *không* rơi vào đây: chuỗi chụp vẫn nộp lại frame cũ theo
+/// nhịp riêng của nó, nên frame đã nén vẫn đều đặn chảy ra.
+const STALL_LIMIT: Duration = Duration::from_secs(5);
+
+/// Nghỉ giữa hai lần dựng lại chuỗi chụp — đủ để driver đồ hoạ hoặc phiên đăng
+/// nhập vừa đổi kịp ổn định.
+const RESTART_DELAY: Duration = Duration::from_secs(1);
+
+/// Dựng lại quá số lần này mà vẫn không có hình thì báo hẳn ra thay vì thử mãi.
+const MAX_RESTARTS: u32 = 5;
+
 /// Hàng đợi frame đã mã hoá giữa luồng chụp và task gửi.
 ///
 /// Sâu 2 chứ không phải 1: một chỗ cho frame đang gửi, một chỗ cho frame kế
@@ -461,6 +474,9 @@ async fn start_encoder(
             }
 
             let mut errors = 0u32;
+            let mut restarts = 0u32;
+            let mut first_frame = true;
+            let mut last_frame = std::time::Instant::now();
             loop {
                 if keyframe.swap(false, Ordering::Relaxed) {
                     source.request_keyframe();
@@ -472,9 +488,19 @@ async fn start_encoder(
                     }
                 }
 
-                match source.next_encoded(Duration::from_millis(500)) {
+                // Lý do phải dựng lại cả chuỗi, nếu có.
+                let broken = match source.next_encoded(Duration::from_millis(500)) {
                     Ok(Some(frame)) => {
                         errors = 0;
+                        last_frame = std::time::Instant::now();
+                        if first_frame {
+                            first_frame = false;
+                            let info = source.info();
+                            events.status(format!(
+                                "đang gửi hình {}x{} {:?}",
+                                info.width, info.height, info.codec
+                            ));
+                        }
                         // Bỏ frame khi hàng đầy thay vì chờ: chờ ở đây là để
                         // frame *sau* già đi theo, mà nó mới là frame đáng gửi.
                         match frame_tx.try_send(frame) {
@@ -482,15 +508,49 @@ async fn start_encoder(
                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
                             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                         }
+                        None
                     }
-                    Ok(None) => {}
+                    // Không có frame là chuyện thường (màn hình đứng yên), nhưng
+                    // đứng yên *quá lâu* thì không còn là màn hình đứng yên nữa:
+                    // chuỗi đã tắc ở đâu đó, mà tắc thầm lặng thì người xem chỉ
+                    // thấy màn hình đen và không biết vì sao.
+                    Ok(None) => (last_frame.elapsed() >= STALL_LIMIT)
+                        .then(|| format!("không lấy được hình nào trong {STALL_LIMIT:?}")),
                     Err(err) => {
                         errors += 1;
                         tracing::warn!(%err, errors, "frame lỗi");
-                        if errors >= 30 {
-                            events.status(format!("dừng chụp màn hình: {err}"));
-                            break;
-                        }
+                        (errors >= 30).then(|| err.to_string())
+                    }
+                };
+
+                let Some(reason) = broken else {
+                    continue;
+                };
+                // Dựng lại thay vì bỏ cuộc: capture chết vì khoá máy, đổi độ
+                // phân giải hay driver đồ hoạ khởi động lại đều là chuyện tự hồi
+                // phục được, và phiên vẫn đang sống — chuột phím bên kia vẫn
+                // chạy, chỉ mỗi hình là mất.
+                restarts += 1;
+                if restarts > MAX_RESTARTS {
+                    events.status(format!("dừng chụp màn hình: {reason}"));
+                    break;
+                }
+                events.status(format!("mất hình ({reason}), đang dựng lại…"));
+                source.stop();
+                std::thread::sleep(RESTART_DELAY);
+                match EncodeSource::start(target_fps, bitrate_kbps, allow_10bit, &viewer_codecs) {
+                    Ok(fresh) => {
+                        source = fresh;
+                        errors = 0;
+                        first_frame = true;
+                        last_frame = std::time::Instant::now();
+                        // Người xem đang giữ một tấm hình chết; chuỗi mới phải
+                        // mở đầu bằng keyframe thì hình mới sống lại được.
+                        source.request_keyframe();
+                    }
+                    Err(err) => {
+                        events.status(format!("không dựng lại được chuỗi chụp: {err}"));
+                        break;
                     }
                 }
             }

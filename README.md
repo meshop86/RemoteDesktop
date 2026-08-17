@@ -85,6 +85,21 @@ Windows: bộ giải mã HEVC không có sẵn mà nằm trong gói *HEVC Video 
 của Microsoft Store. Từ bản 0.1.6, hai máy tự thoả thuận codec chung nên vẫn
 chạy được bằng H.264; cài thêm gói đó thì hình nét hơn ở cùng băng thông.
 
+### Điều khiển được nhưng màn hình bên kia vẫn đen
+
+Lỗi của các bản trước 0.1.8: máy chia sẻ báo *"dừng chụp màn hình: hết thời gian
+chờ"* trong khi chuột và bàn phím vẫn bấm sang được. Hai nguyên nhân, đã sửa cả hai:
+
+- Windows chỉ giao khung hình khi màn hình **đổi**. Màn hình đứng yên là không có
+  gì để mã hoá, bên kia chờ mãi. Nay cứ 200 ms không có gì mới thì gửi lại khung
+  hình cũ — ảnh giống nhau nén còn vài trăm byte, nên gần như không tốn băng thông.
+- Bộ mã hoá phần cứng nuốt vài khung hình rồi mới nhả ra khung đầu tiên. Vòng lặp
+  cũ đòi một-vào-một-ra nên tự treo. Nay vào và ra tách rời nhau.
+
+Nếu chuỗi chụp có chết thật thì chương trình tự dựng lại (tối đa 5 lần) thay vì
+tắt hẳn, và trong lúc chờ, máy điều khiển hiện dòng *"Đã nối — đang chờ hình từ
+máy kia…"* thay vì để màn hình đen không rõ hỏng hay chưa.
+
 ### Quyền trên macOS
 
 Máy **chia sẻ màn hình** phải được cấp hai quyền, nếu không chương trình vẫn
