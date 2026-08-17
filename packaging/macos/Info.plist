@@ -10,6 +10,8 @@
 	<string>com.luongxuanhoa.remotedesktop</string>
 	<key>CFBundleExecutable</key>
 	<string>remote-desktop</string>
+	<key>CFBundleIconFile</key>
+	<string>icon</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleInfoDictionaryVersion</key>

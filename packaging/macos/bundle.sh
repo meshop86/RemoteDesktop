@@ -45,6 +45,19 @@ else
 fi
 chmod +x "$macos_dir/remote-desktop"
 
+# Biểu tượng dựng ngay từ file PNG chung với bản Windows, khỏi giữ thêm một file
+# nhị phân trong repo. sips và iconutil máy macOS nào cũng có sẵn.
+iconset="$(mktemp -d)/icon.iconset"
+mkdir -p "$iconset"
+for size in 16 32 128 256 512; do
+	sips -z "$size" "$size" "$root/packaging/icon.png" \
+		--out "$iconset/icon_${size}x${size}.png" >/dev/null
+	sips -z "$((size * 2))" "$((size * 2))" "$root/packaging/icon.png" \
+		--out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$iconset" -o "$app/Contents/Resources/icon.icns"
+rm -rf "$(dirname "$iconset")"
+
 sed "s/__VERSION__/$version/g" "$root/packaging/macos/Info.plist" >"$app/Contents/Info.plist"
 printf 'APPL????' >"$app/Contents/PkgInfo"
 

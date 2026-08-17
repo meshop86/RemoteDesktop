@@ -29,6 +29,16 @@ SolidCompression=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
+; Bộ cài không biểu tượng, không mô tả là một trong những dấu hiệu khiến
+; SmartScreen và phần mềm diệt virus nghi ngờ. Đường dẫn tính từ file .iss này.
+SetupIconFile=..\icon.ico
+UninstallDisplayIcon={app}\remote-desktop.exe
+AppPublisherURL=https://github.com/meshop86/RemoteDesktop
+AppSupportURL=https://github.com/meshop86/RemoteDesktop/issues
+VersionInfoDescription=Bộ cài Remote Desktop
+VersionInfoProductName=Remote Desktop
+VersionInfoCompany=Luong Xuan Hoa
+VersionInfoCopyright=Copyright (c) 2026 Luong Xuan Hoa
 
 [Languages]
 Name: "vi"; MessagesFile: "compiler:Default.isl"

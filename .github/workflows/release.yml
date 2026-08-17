@@ -63,6 +63,26 @@ jobs:
       - name: Build
         run: cargo build --release -p rd-app -p rd-signal
 
+      # Hai thứ này là nguyên nhân trực tiếp của "báo virus" và "không chạy được"
+      # ở bản 0.1.2, nên kiểm ngay tại đây thay vì đợi người dùng báo lại.
+      - name: Kiểm file exe
+        shell: pwsh
+        run: |
+          foreach ($exe in "remote-desktop", "rd-rendezvous") {
+            $path = "target\release\$exe.exe"
+            $info = [Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path $path))
+            if (-not $info.FileDescription) {
+              throw "$exe.exe thiếu thông tin phiên bản"
+            }
+            # Tìm thẳng trong file: còn tên DLL nghĩa là chưa gắn tĩnh runtime C.
+            $bytes = [IO.File]::ReadAllBytes($path)
+            $text = [Text.Encoding]::ASCII.GetString($bytes)
+            if ($text.Contains("VCRUNTIME140")) {
+              throw "$exe.exe còn phụ thuộc VCRUNTIME140.dll"
+            }
+            "$exe.exe : $($info.FileDescription) $($info.FileVersion)"
+          }
+
       - name: Gom file
         shell: bash
         run: |

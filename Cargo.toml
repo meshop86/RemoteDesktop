@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -30,6 +30,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 parking_lot = "0.12"
 rand = "0.9"
 blake3 = "1"
+# Chỉ chạy lúc build trên Windows: nhúng thông tin phiên bản và biểu tượng vào exe.
+winresource = "0.1"
 
 # Giao diện. Ba crate này phải cùng bản ở mọi nơi: rd-app đưa `wgpu::Device` của
 # eframe sang cho bộ dựng hình trong rd-viewer, lệch bản là hai kiểu khác nhau.

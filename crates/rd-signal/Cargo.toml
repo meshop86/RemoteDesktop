@@ -19,6 +19,9 @@ parking_lot = { workspace = true }
 anyhow = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[build-dependencies]
+winresource = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 

@@ -1,0 +1,11 @@
+# Trên Windows, gắn luôn thư viện chuẩn của C vào file exe.
+#
+# Mặc định Rust dựng bản MSVC là liên kết động: file exe đòi VCRUNTIME140.dll,
+# mà máy Windows mới cài không có sẵn — bấm vào chương trình thì không lên gì
+# cả, hoặc hiện lỗi thiếu DLL. Gắn tĩnh làm file exe nặng thêm vài trăm KB
+# nhưng chạy được trên máy trắng, không cần cài "Visual C++ Redistributable".
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
