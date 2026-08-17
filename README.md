@@ -63,6 +63,11 @@ Nguyên nhân hay gặp nhất là trình điều khiển card màn hình quá c
 trình nhìn thấy. Không có dòng nào nghĩa là Windows không đưa ra card nào dùng
 được; cập nhật driver rồi chạy lại.
 
+Nhật ký dừng ngay sau dòng `dùng card` nghĩa là driver card đó kéo cả chương
+trình chết theo, không kịp báo gì. Cứ **mở lại lần nữa**: lần sau chương trình
+tự bỏ qua đường vẽ vừa hỏng và thử đường khác. Muốn tự chọn thì đặt biến môi
+trường `WGPU_BACKEND` thành `dx12`, `vulkan` hoặc `gl`.
+
 ### Quyền trên macOS
 
 Máy **chia sẻ màn hình** phải được cấp hai quyền, nếu không chương trình vẫn

@@ -50,6 +50,28 @@ jobs:
           "tiến trình vẫn sống sau 25 giây"
           Stop-Process -Id $proc.Id -Force
 
+      - name: Dấu card hỏng phải được xoá
+        run: |
+          $dau = "$env:LOCALAPPDATA\RemoteDesktop\card-loi.txt"
+          if (Test-Path $dau) {
+            throw "giao diện đã lên mà dấu card hỏng vẫn còn: $(Get-Content $dau)"
+          }
+          "không còn dấu nào"
+
+      # Giả bộ lần chạy trước đã chết cùng đúng cái card duy nhất máy này có:
+      # chương trình vẫn phải mở lên, vì thà thử lại còn hơn không có gì để vẽ.
+      - name: Mở lại khi mọi card đều từng hỏng
+        run: |
+          $dau = "$env:LOCALAPPDATA\RemoteDesktop\card-loi.txt"
+          Set-Content $dau "dx12|Microsoft Basic Render Driver"
+          $proc = Start-Process .\target\release\remote-desktop.exe -PassThru
+          Start-Sleep -Seconds 20
+          if ($proc.HasExited) {
+            throw "không mở lên khi có dấu card hỏng, mã thoát $($proc.ExitCode)"
+          }
+          "tiến trình vẫn sống sau 20 giây"
+          Stop-Process -Id $proc.Id -Force
+
       # Đọc dù bước trên có đỏ hay không — chết ở đâu thì nhật ký nói ở đó.
       - name: Nhật ký
         if: always()
