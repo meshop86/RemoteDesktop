@@ -266,29 +266,34 @@ async fn hostile_file_name_cannot_escape_download_dir() {
     assert_eq!(std::fs::read(&written).unwrap(), content);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn big_transfer_does_not_stall_video() {
-    const FRAMES: u32 = 200;
-    const FRAME_SIZE: usize = 30_000;
-    // File đủ lớn để chiếm đường truyền suốt cả đợt video, nhưng không lớn hơn
-    // mức cần thiết: test chạy ở bản debug, mà mã hoá QUIC ở bản debug trên
-    // máy CI hai nhân chậm hơn máy thật vài chục lần.
-    const FILE_SIZE: usize = 16 * 1024 * 1024;
+const FRAMES: u32 = 200;
+const FRAME_SIZE: usize = 30_000;
 
-    let src_dir = TempDir::new("mix-src");
-    let dst_dir = TempDir::new("mix-dst");
-    let (src_path, _) = write_source(src_dir.path(), "iso.img", FILE_SIZE);
+/// Kết quả một đợt phát video.
+struct Burst {
+    received: u32,
+    p50_us: u64,
+    p99_us: u64,
+}
 
-    let link = connect().await;
-    let offer = rd_transport::prepare_offer(&src_path, 3).await.unwrap();
+impl std::fmt::Display for Burst {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}/{FRAMES} frame, p50 {:.2}ms p99 {:.2}ms",
+            self.received,
+            self.p50_us as f64 / 1000.0,
+            self.p99_us as f64 / 1000.0,
+        )
+    }
+}
 
-    // File chạy nền, video chạy song song trên cùng một kết nối.
-    let file_host = link.host.clone();
-    let file_offer = offer.clone();
-    let file_task = tokio::spawn(async move {
-        rd_transport::send_file(&file_host, &file_offer, &src_path, |_| {}).await
-    });
-
+/// Bắn `FRAMES` frame qua kết nối rồi đếm và đo bên nhận.
+///
+/// Frame video đi bằng datagram, mà datagram thì không được gửi lại: nghẽn
+/// đường là rớt luôn. Vậy nên con số đếm được ở đây phụ thuộc vào sức máy, và
+/// chỉ có ý nghĩa khi đem so với một đợt khác chạy trên cùng cái máy đó.
+async fn video_burst(link: &Link) -> Burst {
     let video_host = link.host.clone();
     let video_task = tokio::spawn(async move {
         let mut sender = VideoSender::new(video_host, 0);
@@ -306,6 +311,54 @@ async fn big_transfer_does_not_stall_video() {
         tokio::time::sleep(Duration::from_millis(300)).await;
     });
 
+    let mut receiver = VideoReceiver::new(link.viewer.clone(), 8);
+    let mut latencies_us = Vec::new();
+    // Hạn rộng chỉ để máy CI chậm không bị cắt ngang giữa chừng rồi báo là mất
+    // frame; máy thật xong cả đợt trong khoảng một giây.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while (latencies_us.len() as u32) < FRAMES {
+        match tokio::time::timeout_at(deadline, receiver.next_frame()).await {
+            Ok(Ok(frame)) => latencies_us.push(now_us().saturating_sub(frame.capture_us)),
+            _ => break,
+        }
+    }
+    video_task.await.unwrap();
+
+    assert!(!latencies_us.is_empty(), "không nhận được frame nào");
+    latencies_us.sort_unstable();
+    Burst {
+        received: latencies_us.len() as u32,
+        p50_us: latencies_us[latencies_us.len() / 2],
+        p99_us: latencies_us[latencies_us.len() * 99 / 100],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn big_transfer_does_not_stall_video() {
+    // File đủ lớn để chiếm đường truyền suốt cả đợt video, nhưng không lớn hơn
+    // mức cần thiết: test chạy ở bản debug, mà mã hoá QUIC ở bản debug trên
+    // máy CI hai nhân chậm hơn máy thật vài chục lần.
+    const FILE_SIZE: usize = 16 * 1024 * 1024;
+
+    // Đợt đối chứng: chỉ có video, không có gì tranh đường. Không có mốc này thì
+    // test đang đo sức của cái máy chứ không đo ảnh hưởng của việc truyền file —
+    // và mỗi lần máy CI chậm đi là một lần báo đỏ oan.
+    let baseline = video_burst(&connect().await).await;
+
+    let src_dir = TempDir::new("mix-src");
+    let dst_dir = TempDir::new("mix-dst");
+    let (src_path, _) = write_source(src_dir.path(), "iso.img", FILE_SIZE);
+
+    let link = connect().await;
+    let offer = rd_transport::prepare_offer(&src_path, 3).await.unwrap();
+
+    // File chạy nền, video chạy song song trên cùng một kết nối.
+    let file_host = link.host.clone();
+    let file_offer = offer.clone();
+    let file_task = tokio::spawn(async move {
+        rd_transport::send_file(&file_host, &file_offer, &src_path, |_| {}).await
+    });
+
     let recv_viewer = link.viewer.clone();
     let dst = dst_dir.path().to_path_buf();
     let recv_task = tokio::spawn(async move {
@@ -314,44 +367,30 @@ async fn big_transfer_does_not_stall_video() {
         rd_transport::recv_file(stream, &offer, &dst, |_| {}).await
     });
 
-    let mut receiver = VideoReceiver::new(link.viewer.clone(), 8);
-    let mut latencies_us = Vec::new();
-    // Trên máy này cả test xong trong khoảng một giây; hạn rộng chỉ để máy CI
-    // chậm không bị cắt ngang rồi báo là mất frame.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-    let mut received = 0u32;
-    while received < FRAMES {
-        match tokio::time::timeout_at(deadline, receiver.next_frame()).await {
-            Ok(Ok(frame)) => {
-                latencies_us.push(now_us().saturating_sub(frame.capture_us));
-                received += 1;
-            }
-            _ => break,
-        }
-    }
+    let mixed = video_burst(&link).await;
 
-    video_task.await.unwrap();
     file_task.await.unwrap().unwrap();
     let written = recv_task.await.unwrap().unwrap();
     // Giữ thư mục sống tới đây rồi mới cho `Drop` dọn.
     assert_eq!(std::fs::metadata(&written).unwrap().len(), FILE_SIZE as u64);
 
-    latencies_us.sort_unstable();
-    let p50 = latencies_us[latencies_us.len() / 2];
-    let p99 = latencies_us[latencies_us.len() * 99 / 100];
-    println!(
-        "vừa tải {} MB vừa phát video: nhận {received}/{FRAMES} frame, latency p50 {:.2}ms p99 {:.2}ms",
-        FILE_SIZE / 1_000_000,
-        p50 as f64 / 1000.0,
-        p99 as f64 / 1000.0,
-    );
+    println!("video một mình:  {baseline}");
+    println!("video + {} MB file: {mixed}", FILE_SIZE / 1_000_000);
 
+    // Ngưỡng đặt ở 60% chứ không phải 90%: video và file dùng chung một cửa sổ
+    // nghẽn, nên tải file nặng thì rớt thêm ít frame là đúng thiết kế — thà rớt
+    // frame cũ còn hơn xếp hàng chờ. Cái phải chặn là *khựng hẳn*.
     assert!(
-        received as f32 >= FRAMES as f32 * 0.9,
-        "file nặng làm mất quá nhiều frame: {received}/{FRAMES}"
+        mixed.received as f32 >= baseline.received as f32 * 0.6,
+        "file nặng làm mất quá nhiều frame: {mixed} so với {baseline} khi chạy một mình"
     );
+    // Đây mới là lời hứa của kiến trúc: file đi bằng stream tin cậy, video đi
+    // bằng datagram, nên gói file mất và phải gửi lại *không* được kéo theo
+    // video chờ cùng. Sàn 20ms để máy nhanh không bị so bằng con số nhiễu.
+    let cho_phep = baseline.p99_us.max(20_000) * 4;
     assert!(
-        p99 < 200_000,
-        "file nặng đẩy độ trễ video lên {p99}us — head-of-line blocking"
+        mixed.p99_us <= cho_phep,
+        "file nặng đẩy độ trễ video lên {}us (cho phép {cho_phep}us) — head-of-line blocking",
+        mixed.p99_us
     );
 }
