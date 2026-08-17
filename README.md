@@ -100,6 +100,15 @@ Nếu chuỗi chụp có chết thật thì chương trình tự dựng lại (t
 tắt hẳn, và trong lúc chờ, máy điều khiển hiện dòng *"Đã nối — đang chờ hình từ
 máy kia…"* thay vì để màn hình đen không rõ hỏng hay chưa.
 
+### Báo "phiên bản giao thức lệch"
+
+Hai máy đang chạy hai bản khác nhau, và giữa hai bản đó có thay đổi trong cách
+nói chuyện — 0.1.9 thêm phần đồng bộ clipboard nên không nói chuyện được với
+0.1.8 trở về trước. Cập nhật cả hai máy lên cùng một bản là xong.
+
+Báo thẳng ra như vậy là cố ý: cứ nối bừa rồi hiểu sai gói tin của nhau thì hỏng
+theo kiểu khó đoán hơn nhiều.
+
 ### Quyền trên macOS
 
 Máy **chia sẻ màn hình** phải được cấp hai quyền, nếu không chương trình vẫn
@@ -124,9 +133,39 @@ nó** (cả địa chỉ trong mạng nhà lẫn địa chỉ Tailscale nếu c�
 bên kia gõ vào là xong, khỏi phải đi lục trong cài đặt mạng.
 
 Phím tắt khi đang xem: `F9` bật/tắt điều khiển, `F8` ẩn/hiện bảng chat và tệp,
-`F10` ẩn/hiện thông số. Gửi tệp bằng cách kéo thả vào cửa sổ.
+`F10` ẩn/hiện thông số.
 
 `remote-desktop --help` in đủ danh sách tham số.
+
+### Gửi tệp
+
+Bấm **Chọn tệp để gửi…** trong bảng bên phải để mở hộp thoại của hệ điều hành —
+chọn được nhiều tệp một lúc — hoặc kéo thả thẳng vào cửa sổ. Đầu kia bấm **Nhận**
+thì tệp mới đi; nhận xong có nút **Mở thư mục** trỏ đúng vào tệp vừa về.
+
+Tệp đi trên một kênh riêng, xếp sau kênh chuột phím. Nhờ vậy gửi một tệp mấy GB
+mà chuột vẫn không khựng.
+
+### Copy-paste giữa hai máy
+
+Copy văn bản ở máy này thì dán được ở máy kia, cả hai chiều, không phải bấm gì.
+Tắt bằng ô **Đồng bộ clipboard** trong bảng bên phải — tắt là chương trình thôi
+hẳn việc đọc clipboard, chứ không phải đọc rồi bỏ đi.
+
+Chỉ đồng bộ **văn bản**, tối đa 256 KB mỗi lần. Ảnh và danh sách tệp thì mỗi hệ
+điều hành mô tả một kiểu khác nhau, mà chép nhầm định dạng còn tệ hơn không chép
+— tệp thì đã có đường riêng ở trên rồi.
+
+### Chất lượng đường truyền
+
+Con số kbps trên thanh trên cùng là **trần**, không phải mức phát. Máy chia sẻ tự
+dò xem đường truyền thật sự tải nổi bao nhiêu: mỗi giây nhìn một lần tỉ lệ mất
+gói và độ trễ, sạch thì tăng dần, tắc thì lùi ngay.
+
+Nhìn cả độ trễ chứ không chỉ mất gói là có lý do: router đời mới đệm cả trăm mili
+giây trước khi chịu vứt gói, nên nếu chỉ chờ đến lúc mất gói mới lùi thì người
+xem đã phải chịu cả quãng giật lag dài trước đó. Hạ trần vẫn có ích khi muốn
+nhường băng thông cho việc khác, hoặc khi đang dùng gói dữ liệu tính theo GB.
 
 ## Nối qua Tailscale (cách dễ nhất)
 

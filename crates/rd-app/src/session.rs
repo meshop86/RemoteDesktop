@@ -24,6 +24,7 @@ use rd_viewer::metrics::Metrics;
 use rd_viewer::pipeline::PipelineInfo;
 
 use crate::net::{NetConfig, NetEvent, NetHandle, Role, UiCommand};
+use crate::os::{Clipboard, FilePicker};
 use crate::ui;
 
 /// Một địa chỉ đọc được cho người kia gõ vào.
@@ -292,7 +293,10 @@ pub struct SessionState {
     capture: InputCapture,
     control_on: bool,
     draft: String,
-    file_draft: String,
+    /// Cầu nối clipboard. `None` là người dùng đã tắt đồng bộ — và lúc đó
+    /// chương trình cũng thôi hẳn việc đọc clipboard, chứ không đọc rồi vứt.
+    clipboard: Option<Clipboard>,
+    picker: FilePicker,
     show_hud: bool,
     show_panel: bool,
     unread: u32,
@@ -336,7 +340,10 @@ impl SessionState {
             // thì cú click để phóng to cửa sổ cũng rơi sang bên kia.
             control_on: false,
             draft: String::new(),
-            file_draft: String::new(),
+            // Bật sẵn: copy ở máy này dán được ở máy kia là thứ người dùng
+            // mong đợi có sẵn, giống các phần mềm cùng loại.
+            clipboard: Some(Clipboard::start()),
+            picker: FilePicker::default(),
             show_hud: true,
             show_panel: true,
             unread: 0,
@@ -417,6 +424,11 @@ impl SessionState {
                         self.unread += 1;
                     }
                 }
+                NetEvent::Clipboard(text) => {
+                    if let Some(clipboard) = &self.clipboard {
+                        clipboard.set(text);
+                    }
+                }
                 NetEvent::Link(stats) => self.link = Some(stats),
                 NetEvent::Latency(us) => self.latency_us = Some(us),
                 NetEvent::PeerLeft => {
@@ -431,6 +443,26 @@ impl SessionState {
                     self.ended = Some(reason);
                 }
             }
+        }
+
+        // Người dùng vừa copy ở máy này thì đẩy sang máy kia ngay. Lấy ra cả
+        // khi chưa nối — không thì hàng đợi cứ phình — nhưng chỉ gửi khi có
+        // người ở đầu kia: dồn lại rồi bắn một loạt lúc vừa nối là ghi đè
+        // clipboard của họ bằng những thứ ta copy từ mấy phút trước.
+        let connected = self.connected();
+        if let Some(clipboard) = &self.clipboard {
+            while let Some(text) = clipboard.take_local_change() {
+                if connected {
+                    self.net.send(UiCommand::Clipboard(text));
+                }
+            }
+        }
+
+        // Hộp thoại chọn tệp nằm ở luồng khác nên kết quả về lúc nào không
+        // biết trước — hỏi ở đây chứ không hỏi lúc vẽ, để người dùng có giấu
+        // bảng tệp đi trong lúc chọn thì tệp vẫn được gửi.
+        for path in self.picker.take() {
+            self.net.send(UiCommand::SendFile(path));
         }
 
         if let Some(frame) = self.net.latest_frame() {
@@ -534,16 +566,19 @@ impl SessionState {
                         if ui.button("Yêu cầu keyframe").clicked() {
                             self.net.send(UiCommand::RequestKeyframe);
                         }
-                        ui.label("kbps");
-                        // Chỉnh được giữa phiên vì mạng thay đổi trong lúc
-                        // dùng: chuyển từ wifi sang 4G là phải hạ ngay, không
-                        // thì hình đứng cả chục giây trước khi bộ điều khiển
-                        // tắc nghẽn tự nhận ra.
+                        ui.label("kbps tối đa");
+                        // Là *trần*, không phải mức phát: máy kia tự dò xem
+                        // đường truyền tải nổi bao nhiêu rồi phát trong khoảng
+                        // đó. Hạ trần vẫn có ích khi muốn nhường băng thông cho
+                        // việc khác, hoặc khi đang dùng gói dữ liệu tính theo GB.
                         if ui
                             .add(
                                 egui::DragValue::new(&mut self.bitrate_kbps)
                                     .range(1_000..=200_000)
                                     .speed(500),
+                            )
+                            .on_hover_text(
+                                "Trần băng thông. Máy kia tự dò mức thật theo độ trễ và tỉ lệ mất gói.",
                             )
                             .changed()
                         {
@@ -751,6 +786,17 @@ impl SessionState {
 
     fn draw_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
+        let mut sync_clipboard = self.clipboard.is_some();
+        if ui
+            .checkbox(&mut sync_clipboard, "Đồng bộ clipboard")
+            .on_hover_text("Copy văn bản ở máy này thì dán được ở máy kia, và ngược lại")
+            .changed()
+        {
+            self.clipboard = sync_clipboard.then(Clipboard::start);
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
         ui.heading("Tệp");
         self.draw_transfers(ui);
 
@@ -762,27 +808,23 @@ impl SessionState {
 
     fn draw_transfers(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let field = ui.add(
-                egui::TextEdit::singleline(&mut self.file_draft)
-                    .hint_text("đường dẫn tệp, hoặc kéo thả vào cửa sổ")
-                    .desired_width(f32::INFINITY),
-            );
-            let submitted =
-                field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if submitted && !self.file_draft.trim().is_empty() {
-                let path = PathBuf::from(self.file_draft.trim());
-                self.file_draft.clear();
-                self.net.send(UiCommand::SendFile(path));
+            let button = egui::Button::new("Chọn tệp để gửi…");
+            if ui.add_enabled(!self.picker.busy(), button).clicked() {
+                self.picker.open();
             }
+            ui.label(
+                egui::RichText::new(if self.picker.busy() {
+                    "đang mở hộp thoại…"
+                } else {
+                    "hoặc kéo thả vào cửa sổ"
+                })
+                .small(),
+            );
         });
-        if ui.button("Gửi tệp").clicked() && !self.file_draft.trim().is_empty() {
-            let path = PathBuf::from(self.file_draft.trim());
-            self.file_draft.clear();
-            self.net.send(UiCommand::SendFile(path));
-        }
 
         let mut accept = None;
         let mut reject = None;
+        let mut reveal = None;
         egui::ScrollArea::vertical()
             .id_salt("tệp")
             .max_height(200.0)
@@ -821,13 +863,27 @@ impl SessionState {
                                 ui::bytes(item.rate() as u64)
                             )));
                         }
-                        TransferState::Done(path) => {
-                            let text = match path {
-                                Some(path) => format!("xong → {}", path.display()),
-                                None => "xong".to_string(),
-                            };
-                            ui.colored_label(ui::GOOD, egui::RichText::new(text).small());
-                        }
+                        TransferState::Done(path) => match path {
+                            Some(path) => {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(
+                                        ui::GOOD,
+                                        egui::RichText::new("xong").small(),
+                                    );
+                                    // Đường dẫn đầy đủ không nói lên gì mấy khi
+                                    // nó dài hơn cả bảng; nút mở thẳng tới nơi
+                                    // thì có ích hơn.
+                                    if ui.small_button("Mở thư mục").clicked() {
+                                        reveal = Some(path.clone());
+                                    }
+                                })
+                                .response
+                                .on_hover_text(path.display().to_string());
+                            }
+                            None => {
+                                ui.colored_label(ui::GOOD, egui::RichText::new("xong").small());
+                            }
+                        },
                         TransferState::Rejected => {
                             ui.colored_label(ui::WARN, egui::RichText::new("bị từ chối").small());
                         }
@@ -845,6 +901,9 @@ impl SessionState {
         if let Some(id) = reject {
             self.transfers.reject(id);
             self.net.send(UiCommand::RejectFile(id));
+        }
+        if let Some(path) = reveal {
+            crate::os::reveal(&path);
         }
     }
 

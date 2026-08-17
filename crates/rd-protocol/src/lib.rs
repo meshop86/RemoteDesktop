@@ -14,8 +14,9 @@ pub mod video;
 
 pub use assembler::{AssembledFrame, FrameAssembler};
 pub use control::{
-    ChatMessage, Codec, ControlMessage, FileChunkAck, FileOffer, HostEvent, InputEvent, KeyCode,
-    MonitorInfo, MouseButton, QualityRequest, ViewerCommand,
+    ChatMessage, ClipboardText, Codec, ControlMessage, FileChunkAck, FileOffer, HostEvent,
+    InputEvent, KeyCode, MAX_CLIPBOARD_TEXT, MonitorInfo, MouseButton, QualityRequest,
+    ViewerCommand,
 };
 pub use video::{VIDEO_HEADER_LEN, VideoFlags, VideoHeader, fragment_frame};
 
@@ -28,7 +29,8 @@ pub const MAX_VIDEO_PAYLOAD: usize = MAX_DATAGRAM_SIZE - VIDEO_HEADER_LEN;
 /// Phiên bản giao thức. Hai đầu khác phiên bản thì từ chối bắt tay ngay.
 ///
 /// 2: lời chào của viewer mang thêm danh sách codec nó giải mã được.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// 3: thêm thông điệp đồng bộ clipboard ở cả hai chiều.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {

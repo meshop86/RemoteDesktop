@@ -28,6 +28,7 @@
 
 mod app;
 mod net;
+mod os;
 mod session;
 mod tailscale;
 mod ui;

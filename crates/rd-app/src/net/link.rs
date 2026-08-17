@@ -40,6 +40,8 @@ const PING_INTERVAL: Duration = Duration::from_secs(1);
 /// Thông điệp nhận được, đã quy về nghĩa chung cho cả hai chiều.
 pub enum Incoming {
     Chat(ChatMessage),
+    /// Clipboard đầu kia vừa đổi.
+    Clipboard(String),
     Offer(FileOffer),
     Accept(u64),
     Reject(u64),
@@ -81,6 +83,7 @@ pub trait Wire: Send + Sync + 'static {
     fn space() -> IdSpace;
 
     fn chat(message: ChatMessage) -> Self::Out;
+    fn clipboard(text: String) -> Self::Out;
     fn offer(offer: FileOffer) -> Self::Out;
     fn accept(transfer_id: u64) -> Self::Out;
     fn reject(transfer_id: u64) -> Self::Out;
@@ -202,6 +205,10 @@ async fn read_loop<W: Wire>(
         let message = rx.recv().await?;
         match W::classify(message) {
             Incoming::Chat(message) => link.emit(NetEvent::Chat(message)),
+            Incoming::Clipboard(text) => {
+                tracing::debug!(len = text.len(), "nhận clipboard từ máy kia");
+                link.emit(NetEvent::Clipboard(text));
+            }
             Incoming::Offer(offer) => on_offer(&link, offer),
             Incoming::Accept(id) => on_accept(&link, id),
             Incoming::Reject(id) => {
@@ -364,6 +371,17 @@ async fn command_loop<W: Wire>(
                 }
             }
             UiCommand::Chat(message) => link.send(W::chat(message)),
+            UiCommand::Clipboard(text) => {
+                // Cắt ở đây chứ không ở chỗ đọc clipboard: chỗ đó không biết
+                // trần của đường truyền, còn ở đây thì cắt sớm hơn một tầng so
+                // với chỗ sẽ ném lỗi và đóng cả kênh.
+                if text.len() <= rd_protocol::MAX_CLIPBOARD_TEXT {
+                    tracing::debug!(len = text.len(), "gửi clipboard sang máy kia");
+                    link.send(W::clipboard(text));
+                } else {
+                    tracing::debug!(len = text.len(), "clipboard quá dài, không đồng bộ");
+                }
+            }
             UiCommand::SendFile(path) => spawn_offer(&link, path),
             UiCommand::AcceptFile(id) => {
                 let offer = link.offered_in.lock().expect("khoá lời mời").remove(&id);

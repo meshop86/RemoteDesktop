@@ -85,6 +85,11 @@ where
 {
     let mut file = tokio::fs::File::open(path).await?;
     let mut stream = session.open_uni().await?;
+    // Xếp sau kênh điều khiển. Không có dòng này thì QUIC chia đều băng thông
+    // giữa các stream, nên đang gửi một file 4 GB là chuột phím phải chen chân
+    // với nó — mà chuột trễ nửa giây thì người dùng thấy ngay, còn file chậm
+    // thêm vài phần trăm thì không ai để ý.
+    stream.set_priority(-1).ok();
     stream.write_all(&offer.transfer_id.to_le_bytes()).await?;
 
     let mut buf = vec![0u8; CHUNK];

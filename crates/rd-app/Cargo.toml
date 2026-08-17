@@ -34,6 +34,8 @@ tracing-subscriber = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 wgpu = { workspace = true }
+arboard = { workspace = true }
+rfd = { workspace = true }
 
 [build-dependencies]
 winresource = { workspace = true }

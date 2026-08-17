@@ -16,10 +16,11 @@ use anyhow::Context as _;
 use rd_codec::EncodedFrame;
 use rd_input::{InputInjector as _, PlatformInjector, ScreenGeometry};
 use rd_protocol::control::{
-    ChatMessage, FileChunkAck, FileOffer, HostEvent, InputEvent, MonitorInfo, QualityRequest,
-    ViewerCommand,
+    ChatMessage, ClipboardText, FileChunkAck, FileOffer, HostEvent, InputEvent, MonitorInfo,
+    QualityRequest, ViewerCommand,
 };
 use rd_session::IdSpace;
+use rd_session::rate::{LinkSample, RateController};
 use rd_signal::client::local_candidates;
 use rd_signal::{Call, PeerId, RelayLink, SignalClient};
 use rd_transport::{
@@ -59,6 +60,13 @@ const MAX_RESTARTS: u32 = 5;
 /// tiếp. Sâu hơn nữa chỉ tích thêm frame cũ, mà frame cũ đã hết giá trị.
 const ENCODED_QUEUE: usize = 2;
 
+/// Nhịp dò lại bitrate.
+///
+/// Một giây là khoảng cân bằng: ngắn hơn thì mỗi lần đo chỉ bắt được vài chục
+/// gói nên tỉ lệ mất gói nhiễu tới mức vô dụng, dài hơn thì đường tụt băng
+/// thông mà ta còn bơm nguyên mức cũ thêm mấy giây nữa.
+const RATE_INTERVAL: Duration = Duration::from_secs(1);
+
 pub struct HostWire;
 
 impl Wire for HostWire {
@@ -71,6 +79,10 @@ impl Wire for HostWire {
 
     fn chat(message: ChatMessage) -> HostEvent {
         HostEvent::Chat(message)
+    }
+
+    fn clipboard(text: String) -> HostEvent {
+        HostEvent::Clipboard(ClipboardText { text })
     }
 
     fn offer(offer: FileOffer) -> HostEvent {
@@ -112,6 +124,7 @@ impl Wire for HostWire {
     fn classify(message: ViewerCommand) -> Incoming {
         match message {
             ViewerCommand::Chat(message) => Incoming::Chat(message),
+            ViewerCommand::Clipboard(data) => Incoming::Clipboard(data.text),
             ViewerCommand::FileOffer(offer) => Incoming::Offer(offer),
             ViewerCommand::FileAccept { transfer_id } => Incoming::Accept(transfer_id),
             ViewerCommand::FileReject { transfer_id } => Incoming::Reject(transfer_id),
@@ -326,12 +339,17 @@ async fn serve(
     };
 
     let keyframe = Arc::new(AtomicBool::new(true));
+    // Hai con số khác nhau: `ceiling` là mức người dùng đặt (viewer gửi sang),
+    // `bitrate` là mức bộ dò thật sự chốt và luồng mã hoá đọc.
+    let ceiling = Arc::new(AtomicU32::new(0));
     let bitrate = Arc::new(AtomicU32::new(0));
+    let rate = RateController::new(ctx.config.bitrate_kbps);
     // Chỉ dùng 4:2:2 10-bit khi *cả hai* đầu làm được: bên này mã hoá được và
     // bên kia dựng hình được.
     let allow_10bit = ctx.config.allow_10bit && hello.wants_10bit;
     let (info, mut encoded_rx) = start_encoder(
         ctx,
+        rate.current(),
         allow_10bit,
         hello.codecs,
         keyframe.clone(),
@@ -357,7 +375,7 @@ async fn serve(
     tx.send(&HostEvent::QualityChanged(QualityRequest {
         codec: info.codec,
         chroma: info.chroma,
-        target_bitrate_kbps: ctx.config.bitrate_kbps,
+        target_bitrate_kbps: rate.current(),
         target_fps: info.target_fps,
         max_dimension: None,
     }))
@@ -375,19 +393,40 @@ async fn serve(
     let video = AbortOnDrop(tokio::spawn({
         let session = session.clone();
         let codec = info.codec;
+        let keyframe = keyframe.clone();
         async move {
             let mut sender = VideoSender::new(session, 0);
             while let Some(frame) = encoded_rx.recv().await {
-                sender.send_frame(&frame.data, codec, frame.keyframe, frame.pts_us)?;
+                let sent = sender.send_frame(&frame.data, codec, frame.keyframe, frame.pts_us)?;
+                // Không gửi được frame nào nghĩa là hàng đợi datagram đã đầy và
+                // frame này rơi giữa chừng — chuỗi dự đoán bên kia đứt từ đây.
+                // Phát keyframe ngay thay vì chờ viewer phát hiện rồi xin: chờ
+                // như vậy mất trọn một vòng mạng, mà trong quãng đó người xem
+                // nhìn một tấm hình vỡ.
+                //
+                // Trừ đúng trường hợp chính keyframe bị rơi: lúc đó đường đang
+                // không tải nổi khung hình lớn nhất, phát tiếp một cái nữa chỉ
+                // làm nghẽn thêm. Để bộ dò bitrate hạ mức xuống trước đã.
+                if sent == 0 && !frame.keyframe {
+                    keyframe.store(true, Ordering::Relaxed);
+                }
             }
             Ok::<(), anyhow::Error>(())
         }
     }));
 
+    // Giữ tới hết phiên: thả là bitrate đứng im ở mức đang có.
+    let _rates = AbortOnDrop(tokio::spawn(rate_loop(
+        session.clone(),
+        rate,
+        ceiling.clone(),
+        bitrate,
+    )));
+
     let hooks = Hooks {
         input: Some(input),
         keyframe: Some(keyframe),
-        bitrate: Some(bitrate),
+        bitrate: Some(ceiling),
         clock: None,
     };
 
@@ -443,6 +482,7 @@ fn check_hello(ctx: &Arc<Context>, hello: ViewerCommand) -> anyhow::Result<Hello
 /// vào luồng đã tạo ra đối tượng.
 async fn start_encoder(
     ctx: &Arc<Context>,
+    start_kbps: u32,
     allow_10bit: bool,
     viewer_codecs: Vec<rd_protocol::control::Codec>,
     keyframe: Arc<AtomicBool>,
@@ -451,7 +491,9 @@ async fn start_encoder(
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<anyhow::Result<PipelineInfo>>();
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<EncodedFrame>(ENCODED_QUEUE);
     let target_fps = ctx.config.target_fps;
-    let bitrate_kbps = ctx.config.bitrate_kbps;
+    // Mức bộ dò đang chốt. Giữ lại để lúc dựng lại chuỗi còn mở đúng ở mức
+    // đường truyền chịu được, chứ không quay về mức khởi điểm.
+    let mut bitrate_kbps = start_kbps;
     let events = ctx.events.clone();
 
     std::thread::Builder::new()
@@ -483,6 +525,7 @@ async fn start_encoder(
                 }
                 let kbps = bitrate.swap(0, Ordering::Relaxed);
                 if kbps > 0 {
+                    bitrate_kbps = kbps;
                     if let Err(err) = source.set_bitrate(kbps) {
                         tracing::warn!(%err, kbps, "không đổi được bitrate");
                     }
@@ -561,6 +604,51 @@ async fn start_encoder(
     let info = ready_rx.await.context("luồng mã hoá chết khi khởi động")??;
     tracing::info!(?info, "chuỗi chụp + mã hoá đã chạy");
     Ok((info, frame_rx))
+}
+
+/// Dò bitrate suốt phiên.
+///
+/// Mỗi nhịp hỏi QUIC xem đường truyền đang thế nào rồi để [`RateController`]
+/// quyết mức mới; mức đó ghi vào ô nhớ mà luồng mã hoá đọc.
+///
+/// Con số viewer gửi sang được hiểu là **trần** chứ không phải mức phát: người
+/// dùng nói "tối đa 30 Mbps", còn đường truyền có tải nổi 30 Mbps hay không thì
+/// chỉ đo mới biết.
+async fn rate_loop(
+    session: Session,
+    mut rate: RateController,
+    ceiling: Arc<AtomicU32>,
+    bitrate: Arc<AtomicU32>,
+) {
+    let mut ticker = tokio::time::interval(RATE_INTERVAL);
+    // Máy ngủ dậy thì bỏ qua các nhịp đã lỡ: dồn chúng lại chỉ tạo một chuỗi
+    // phép đo trên cùng một ảnh chụp đường truyền.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+
+        let requested = ceiling.swap(0, Ordering::Relaxed);
+        let forced = (requested > 0).then(|| rate.set_ceiling(requested)).flatten();
+
+        let stats = session.link_stats();
+        let probed = rate.update(LinkSample {
+            rtt: stats.rtt,
+            lost_packets: stats.lost_packets,
+            sent_packets: stats.sent_packets,
+        });
+
+        // Bộ dò chạy *sau* khi trần đã đổi nên nó nhìn con số đã kẹp rồi; ý nó
+        // mới hơn, lấy nó trước.
+        if let Some(kbps) = probed.or(forced) {
+            tracing::debug!(
+                kbps,
+                rtt_ms = stats.rtt.as_millis(),
+                loss = stats.loss_ratio(),
+                "đổi bitrate theo đường truyền"
+            );
+            bitrate.store(kbps, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Luồng bơm input. Trả về đầu gửi để kênh điều khiển đẩy sự kiện vào.

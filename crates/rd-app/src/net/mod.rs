@@ -106,6 +106,8 @@ pub enum NetEvent {
         reason: String,
     },
     Chat(ChatMessage),
+    /// Clipboard đầu kia vừa đổi — ghi đè clipboard máy này.
+    Clipboard(String),
     Link(LinkStats),
     /// Độ trễ một chiều đo được sau khi đồng bộ đồng hồ, tính bằng micro giây.
     Latency(u64),
@@ -121,6 +123,8 @@ pub enum NetEvent {
 pub enum UiCommand {
     Input(Vec<InputEvent>),
     Chat(ChatMessage),
+    /// Clipboard máy này vừa đổi — đẩy sang máy kia.
+    Clipboard(String),
     SendFile(PathBuf),
     AcceptFile(u64),
     RejectFile(u64),

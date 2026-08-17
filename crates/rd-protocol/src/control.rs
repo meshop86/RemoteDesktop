@@ -158,6 +158,24 @@ pub struct FileChunkAck {
     pub received_bytes: u64,
 }
 
+/// Trần độ dài đoạn văn bản đồng bộ qua clipboard.
+///
+/// Clipboard đi trên kênh tin cậy, cùng chỗ với chuột phím. Ai đó copy nguyên
+/// một file log 50 MB rồi ta chuyển thẳng sang thì chuột đứng hình suốt quãng
+/// đó. 256 KB đủ cho mọi đoạn văn bản người ta thật sự copy tay, và vẫn nằm
+/// gọn dưới trần một control message.
+pub const MAX_CLIPBOARD_TEXT: usize = 256 * 1024;
+
+/// Nội dung clipboard vừa đổi ở một đầu, gửi sang đầu kia.
+///
+/// Chỉ văn bản. Ảnh và danh sách file thì mỗi hệ điều hành mô tả một kiểu, mà
+/// chép nhầm định dạng còn tệ hơn không chép — file thì đã có đường truyền
+/// riêng rồi.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardText {
+    pub text: String,
+}
+
 /// Viewer → host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ViewerCommand {
@@ -204,6 +222,8 @@ pub enum ViewerCommand {
         transfer_id: u64,
     },
     FileChunkAck(FileChunkAck),
+    /// Clipboard bên viewer vừa đổi.
+    Clipboard(ClipboardText),
     /// Viewer báo tình hình mạng để host chỉnh bitrate.
     Feedback {
         frames_received: u32,
@@ -241,6 +261,8 @@ pub enum HostEvent {
     /// Đối xứng với [`ViewerCommand::FileChunkAck`]: file đi được cả hai chiều
     /// nên bên nào cũng phải báo được "đã ghi tới đâu" cho bên gửi vẽ tiến độ.
     FileChunkAck(FileChunkAck),
+    /// Clipboard bên host vừa đổi.
+    Clipboard(ClipboardText),
     Pong {
         sent_us: u64,
         host_us: u64,
@@ -294,6 +316,31 @@ mod tests {
         };
         let bytes = encode_control(&msg);
         assert_eq!(decode_control::<HostEvent>(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn clipboard_roundtrips_both_directions() {
+        let text = "xin chào — Ω 🙂\nhai dòng".to_string();
+        let from_viewer = ViewerCommand::Clipboard(ClipboardText { text: text.clone() });
+        assert_eq!(
+            decode_control::<ViewerCommand>(&encode_control(&from_viewer)).unwrap(),
+            from_viewer
+        );
+        let from_host = HostEvent::Clipboard(ClipboardText { text });
+        assert_eq!(
+            decode_control::<HostEvent>(&encode_control(&from_host)).unwrap(),
+            from_host
+        );
+    }
+
+    #[test]
+    fn clipboard_at_the_cap_still_fits_a_control_message() {
+        // Trần clipboard phải nằm gọn dưới trần một control message, kể cả khi
+        // toàn ký tự 4 byte — không thì đoạn văn bản hợp lệ vẫn bị chặn ở tầng
+        // dưới và người dùng chỉ thấy "mất kết nối".
+        let text = "🙂".repeat(MAX_CLIPBOARD_TEXT / 4);
+        let bytes = encode_control(&ViewerCommand::Clipboard(ClipboardText { text }));
+        assert!(bytes.len() <= MAX_CLIPBOARD_TEXT + 16, "{} byte", bytes.len());
     }
 
     #[test]

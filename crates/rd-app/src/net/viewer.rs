@@ -13,7 +13,8 @@ use std::time::Duration;
 use anyhow::Context as _;
 use rd_protocol::AssembledFrame;
 use rd_protocol::control::{
-    ChatMessage, FileChunkAck, FileOffer, HostEvent, InputEvent, QualityRequest, ViewerCommand,
+    ChatMessage, ClipboardText, FileChunkAck, FileOffer, HostEvent, InputEvent, QualityRequest,
+    ViewerCommand,
 };
 use rd_session::IdSpace;
 use rd_signal::client::local_candidates;
@@ -49,6 +50,10 @@ impl Wire for ViewerWire {
 
     fn chat(message: ChatMessage) -> ViewerCommand {
         ViewerCommand::Chat(message)
+    }
+
+    fn clipboard(text: String) -> ViewerCommand {
+        ViewerCommand::Clipboard(ClipboardText { text })
     }
 
     fn offer(offer: FileOffer) -> ViewerCommand {
@@ -90,6 +95,7 @@ impl Wire for ViewerWire {
     fn classify(message: HostEvent) -> Incoming {
         match message {
             HostEvent::Chat(message) => Incoming::Chat(message),
+            HostEvent::Clipboard(data) => Incoming::Clipboard(data.text),
             HostEvent::FileOffer(offer) => Incoming::Offer(offer),
             HostEvent::FileAccept { transfer_id } => Incoming::Accept(transfer_id),
             HostEvent::FileReject { transfer_id } => Incoming::Reject(transfer_id),

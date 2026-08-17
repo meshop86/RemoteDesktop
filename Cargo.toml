@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -40,6 +40,13 @@ winresource = "0.1"
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts"] }
 egui = "0.36"
 wgpu = "30"
+
+# Clipboard hệ thống. Tắt `image-data`: ta chỉ đồng bộ văn bản, mà tính năng đó
+# kéo theo cả một bộ thư viện xử lý ảnh.
+arboard = { version = "3", default-features = false }
+# Hộp thoại chọn tệp của chính hệ điều hành. `default-features = false` bỏ phần
+# nền GTK chỉ dùng cho Linux — ta chỉ build macOS và Windows.
+rfd = { version = "0.15", default-features = false }
 
 [profile.release]
 opt-level = 3

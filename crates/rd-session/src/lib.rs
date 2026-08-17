@@ -10,7 +10,9 @@
 //! [`rd_transport`]: https://docs.rs/rd-transport
 
 pub mod chat;
+pub mod rate;
 pub mod transfer;
 
 pub use chat::{ChatLog, MAX_CHAT_BODY};
+pub use rate::{LinkSample, RateController};
 pub use transfer::{Direction, IdSpace, Transfer, TransferState, Transfers};
