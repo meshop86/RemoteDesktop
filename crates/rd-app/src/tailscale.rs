@@ -190,6 +190,7 @@ fn run(args: &[&str]) -> Result<String, String> {
     let mut command = Command::new(&binary);
     command.args(args);
     hide_console(&mut command);
+    nhu_dong_lenh(&mut command);
 
     let output = command
         .output()
@@ -204,6 +205,24 @@ fn run(args: &[&str]) -> Result<String, String> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
+
+/// Nói cho Tailscale biết đây là một lời gọi dòng lệnh.
+///
+/// Bản macOS xem `TERM`, `SHLVL` và `TERM_PROGRAM` để đoán nó đang được gõ
+/// trong cửa sổ dòng lệnh hay được giao diện gọi. Ứng dụng mở từ Finder không
+/// có biến nào trong ba biến ấy, nên nó tưởng phải bật giao diện Tailscale lên,
+/// rồi bỏ ra câu "The Tailscale GUI failed to start" — kèm mã thoát 0 — thay vì
+/// trả lời. Đặt `TERM` là hết: `dumb` đúng nghĩa "có đọc chữ nhưng đừng tô màu".
+#[cfg(target_os = "macos")]
+fn nhu_dong_lenh(command: &mut Command) {
+    let co_san = std::env::var_os("TERM").is_some_and(|term| !term.is_empty());
+    if !co_san {
+        command.env("TERM", "dumb");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn nhu_dong_lenh(_command: &mut Command) {}
 
 /// Đừng để cửa sổ console đen nhấp nháy mỗi lần hỏi trạng thái.
 #[cfg(target_os = "windows")]
@@ -587,6 +606,7 @@ pub fn login() -> Result<String, String> {
     let mut command = Command::new(&binary);
     command.arg("login");
     hide_console(&mut command);
+    nhu_dong_lenh(&mut command);
     command
         .spawn()
         .map_err(|err| format!("không chạy được `tailscale login`: {err}"))?;
