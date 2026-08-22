@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use eframe::egui;
 
-#[cfg(target_os = "macos")]
-use rd_codec::videotoolbox::DecodedFrame;
 #[cfg(target_os = "windows")]
 use rd_codec::mediafoundation::DecodedFrame;
+#[cfg(target_os = "macos")]
+use rd_codec::videotoolbox::DecodedFrame;
 
 use rd_viewer::metrics::Summary;
 use rd_viewer::pipeline::PipelineInfo;
@@ -141,12 +141,7 @@ pub fn draw_hud(ui: &mut egui::Ui, data: &HudData<'_>) {
                 ui.separator();
             }
             for (text, color) in &data.lines {
-                ui.label(
-                    egui::RichText::new(text)
-                        .monospace()
-                        .small()
-                        .color(*color),
-                );
+                ui.label(egui::RichText::new(text).monospace().small().color(*color));
             }
         });
 }

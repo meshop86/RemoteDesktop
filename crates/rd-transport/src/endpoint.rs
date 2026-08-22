@@ -7,8 +7,8 @@
 //!   nên giữ hàng đợi ngắn, đúng thứ video tương tác cần.
 //! * **Datagram buffer lớn** — một keyframe 4K có thể vài megabyte, chia thành
 //!   hàng nghìn datagram bắn ra trong vài mili giây.
-//! * **initial_mtu 1280** — vừa vặn cả đường qua Tailscale/WireGuard; quinn tự
-//!   dò lên cao hơn khi đường truyền cho phép.
+//! * **initial_mtu 1232** — vừa vặn cả đường qua Tailscale/WireGuard, kể cả
+//!   khi lớp dưới là IPv6.
 //! * **keep_alive 2s** — giữ lỗ NAT luôn mở khi màn hình đứng yên không gửi gì.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -39,11 +39,15 @@ pub fn transport_config() -> TransportConfig {
     config.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     config.datagram_send_buffer_size(4 * 1024 * 1024);
     config.congestion_controller_factory(Arc::new(BbrConfig::default()));
-    // 1280 là MTU của card mạng ảo Tailscale/WireGuard, cũng là sàn của IPv6.
-    // Đoán cao hơn thì gói đầu tiên rơi im lặng ở đó và bắt tay phải chờ hết
-    // một lượt truyền lại. Không mất gì: quinn vẫn tự dò lên tới 1452 sau đó.
-    config.initial_mtu(1280);
-    config.min_mtu(1200);
+    // Con số này là *tải UDP*, không phải MTU của đường truyền. Card mạng ảo
+    // Tailscale/WireGuard có MTU 1280, trừ 40 byte đầu IPv6 và 8 byte đầu UDP
+    // còn 1232. Đặt 1280 như trước là gói đi ra dài 1308 byte: Windows trả
+    // thẳng WSAEMSGSIZE (10040) và *không* gói video nào ra khỏi máy được.
+    config.initial_mtu(1232);
+    config.min_mtu(1232);
+    // Tắt dò MTU: nó thăm dò tới 1452, mỗi lần thăm dò là một lần lỗi 10040
+    // nữa. Đường đi thật của phần mềm này gần như luôn là Tailscale.
+    config.mtu_discovery_config(None);
     config
 }
 

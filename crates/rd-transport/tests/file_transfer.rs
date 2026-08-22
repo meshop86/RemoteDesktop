@@ -24,11 +24,8 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(tag: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "rd-file-{tag}-{}-{}",
-            std::process::id(),
-            now_us()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("rd-file-{tag}-{}-{}", std::process::id(), now_us()));
         std::fs::create_dir_all(&path).unwrap();
         Self(path)
     }
@@ -179,7 +176,10 @@ async fn file_arrives_intact_and_fast() {
         .unwrap();
 
     let mut stream = link.viewer.accept_uni().await.unwrap();
-    assert_eq!(rd_transport::read_transfer_id(&mut stream).await.unwrap(), 7);
+    assert_eq!(
+        rd_transport::read_transfer_id(&mut stream).await.unwrap(),
+        7
+    );
 
     let mut progress_steps = 0u32;
     let written = rd_transport::recv_file(stream, &offer_received, dst_dir.path(), |_| {
@@ -193,7 +193,10 @@ async fn file_arrives_intact_and_fast() {
     assert_eq!(written.file_name().unwrap(), "bao-cao.pdf");
     assert_eq!(std::fs::read(&written).unwrap(), content);
     assert_eq!(sent_bytes.load(Ordering::Relaxed), SIZE as u64);
-    assert!(progress_steps > 1, "thanh tiến trình phải nhúc nhích nhiều lần");
+    assert!(
+        progress_steps > 1,
+        "thanh tiến trình phải nhúc nhích nhiều lần"
+    );
 
     let mbps = SIZE as f64 / elapsed.as_secs_f64() / 1_000_000.0;
     println!("gửi {SIZE} byte mất {elapsed:?} — {mbps:.0} MB/s trên loopback");
@@ -213,7 +216,9 @@ async fn corrupted_content_is_caught_and_leaves_no_file() {
 
     let host = link.host.clone();
     let sender =
-        tokio::spawn(async move { rd_transport::send_file(&host, &honest, &src_path, |_| {}).await });
+        tokio::spawn(
+            async move { rd_transport::send_file(&host, &honest, &src_path, |_| {}).await },
+        );
 
     let mut stream = link.viewer.accept_uni().await.unwrap();
     rd_transport::read_transfer_id(&mut stream).await.unwrap();
@@ -394,4 +399,79 @@ async fn big_transfer_does_not_stall_video() {
         "file nặng đẩy độ trễ video lên {}us (cho phép {cho_phep}us) — head-of-line blocking",
         mixed.p99_us
     );
+}
+
+/// Người nhận đổi ý giữa chừng: cắt task đang chạy rồi dọn file dở.
+///
+/// Đây đúng là cách `huy_tai_cho` bên rd-app làm — `recv_file` bị `abort()`
+/// giữa hai lần `await` nên đoạn dọn dẹp trong chính nó không bao giờ chạy;
+/// người huỷ phải tự xoá qua [`rd_transport::partial_path`]. Test này giữ hai
+/// đầu ấy khớp nhau: đổi tên file tạm mà quên sửa hàm kia là nó đỏ ngay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_mid_flight_stops_both_sides_and_leaves_no_partial() {
+    const SIZE: usize = 64 * 1024 * 1024;
+    const ID: u64 = 11;
+
+    let src_dir = TempDir::new("cancel-src");
+    let dst_dir = TempDir::new("cancel-dst");
+    let (src_path, _) = write_source(src_dir.path(), "phim.mkv", SIZE);
+
+    let link = connect().await;
+    let offer = rd_transport::prepare_offer(&src_path, ID).await.unwrap();
+
+    let host = link.host.clone();
+    let send_offer = offer.clone();
+    let sender = tokio::spawn(async move {
+        rd_transport::send_file(&host, &send_offer, &src_path, |_| {}).await
+    });
+
+    let mut stream = link.viewer.accept_uni().await.unwrap();
+    assert_eq!(
+        rd_transport::read_transfer_id(&mut stream).await.unwrap(),
+        ID
+    );
+
+    let got = Arc::new(AtomicU64::new(0));
+    let probe = got.clone();
+    let dest = dst_dir.path().to_path_buf();
+    let receiver = tokio::spawn(async move {
+        rd_transport::recv_file(stream, &offer, &dest, move |done| {
+            probe.store(done, Ordering::Relaxed);
+        })
+        .await
+    });
+
+    // Chờ tới lúc thật sự đang chảy — huỷ trước khi có byte nào thì không
+    // chứng minh được điều gì về file dở.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while got.load(Ordering::Relaxed) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "chưa nhận được byte nào"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let partial = rd_transport::partial_path(dst_dir.path(), ID);
+    assert!(partial.exists(), "đang nhận dở mà không thấy file tạm");
+
+    receiver.abort();
+    assert!(receiver.await.unwrap_err().is_cancelled());
+    tokio::fs::remove_file(&partial).await.unwrap();
+
+    // Thả `RecvStream` sẽ gửi STOP_SENDING, nên bên gửi cũng phải dừng — không
+    // để nó bơm nốt 64 MB vào hư không.
+    let ended = tokio::time::timeout(Duration::from_secs(10), sender)
+        .await
+        .expect("bên gửi phải dừng theo, không được bơm hết file")
+        .unwrap();
+    assert!(
+        ended.is_err(),
+        "bên gửi báo gửi xong dù đầu kia đã cắt: {ended:?}"
+    );
+
+    let leftovers: Vec<_> = std::fs::read_dir(dst_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(leftovers.is_empty(), "huỷ rồi mà còn sót: {leftovers:?}");
 }

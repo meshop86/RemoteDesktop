@@ -4,10 +4,10 @@ name: Smoke Windows
 # test — mà "cài xong bấm vào không lên gì" là loại lỗi chỉ lộ ra khi có ai đó
 # bấm vào thật.
 
+# Bấm tay thôi: chạy kèm mỗi tag là thêm một runner Windows nữa cho mỗi bản
+# phát hành, trong khi bản thân job Release đã kiểm file exe rồi.
 on:
   workflow_dispatch:
-  push:
-    tags: ["v*"]
 
 jobs:
   smoke:
@@ -49,6 +49,40 @@ jobs:
           }
           "tiến trình vẫn sống sau 25 giây"
           Stop-Process -Id $proc.Id -Force
+
+      - name: Tự kiểm clipboard và mục tự khởi động
+        run: |
+          $out = & .\target\release\remote-desktop.exe --tu-kiem 2>&1 | Out-String
+          $out
+          if ($LASTEXITCODE -ne 0) { throw "--tu-kiem thoát với mã $LASTEXITCODE" }
+
+      - name: Clipboard đi từ máy chia sẻ sang máy điều khiển
+        run: |
+          # Hai tiến trình trên cùng một máy Windows: một chia sẻ, một điều
+          # khiển. Cả hai ghi chung một file log nên đọc một chỗ là thấy cả
+          # hai chiều.
+          $log = "$env:LOCALAPPDATA\RemoteDesktop\rd.log"
+          Remove-Item $log -ErrorAction SilentlyContinue
+          $host_ = Start-Process .\target\release\remote-desktop.exe `
+            -ArgumentList "--host","--password","ci-clip","--port","47901" -PassThru
+          Start-Sleep -Seconds 8
+          $viewer = Start-Process .\target\release\remote-desktop.exe `
+            -ArgumentList "--connect","127.0.0.1:47901","--password","ci-clip" -PassThru
+          Start-Sleep -Seconds 10
+          Set-Clipboard -Value "RD-CI-CLIP-7731"
+          Start-Sleep -Seconds 5
+          Stop-Process -Id $viewer.Id -Force -ErrorAction SilentlyContinue
+          Stop-Process -Id $host_.Id -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+          $noi_dung = Get-Content $log -Raw
+          $noi_dung
+          if (-not $noi_dung.Contains("máy này vừa copy")) {
+            throw "máy chia sẻ không thấy nội dung vừa copy"
+          }
+          if (-not $noi_dung.Contains("đã dán clipboard của máy kia")) {
+            throw "máy điều khiển không dán được clipboard nhận về"
+          }
+          "clipboard đi hết vòng trên Windows thật"
 
       - name: Dấu card hỏng phải được xoá
         run: |

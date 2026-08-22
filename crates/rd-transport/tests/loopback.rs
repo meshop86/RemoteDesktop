@@ -3,9 +3,7 @@
 
 use std::time::Duration;
 
-use rd_protocol::{
-    control::{Codec, HostEvent, ViewerCommand},
-};
+use rd_protocol::control::{Codec, HostEvent, ViewerCommand};
 use rd_transport::{
     ClockSync, Session, VideoReceiver, VideoSender, client_endpoint, generate_self_signed, now_us,
     server_endpoint,
@@ -31,7 +29,12 @@ async fn video_over_loopback_keeps_frames_intact_and_fast() {
     let server_addr = server.local_addr().unwrap();
 
     let host = tokio::spawn(async move {
-        let conn = server.accept().await.expect("có kết nối tới").await.unwrap();
+        let conn = server
+            .accept()
+            .await
+            .expect("có kết nối tới")
+            .await
+            .unwrap();
         let session = Session::new(conn);
         let (mut tx, mut rx) = session
             .accept_control::<HostEvent, ViewerCommand>()
@@ -40,7 +43,9 @@ async fn video_over_loopback_keeps_frames_intact_and_fast() {
 
         // Bắt tay + trả lời ping để viewer đồng bộ đồng hồ.
         match rx.recv().await.unwrap() {
-            ViewerCommand::Hello { version, .. } => assert_eq!(version, rd_protocol::PROTOCOL_VERSION),
+            ViewerCommand::Hello { version, .. } => {
+                assert_eq!(version, rd_protocol::PROTOCOL_VERSION)
+            }
             other => panic!("mong đợi Hello, nhận {other:?}"),
         }
         tx.send(&HostEvent::Welcome {
@@ -83,7 +88,11 @@ async fn video_over_loopback_keeps_frames_intact_and_fast() {
     });
 
     let client = client_endpoint("127.0.0.1:0".parse().unwrap(), Some(fingerprint)).unwrap();
-    let conn = client.connect(server_addr, "rd-host").unwrap().await.unwrap();
+    let conn = client
+        .connect(server_addr, "rd-host")
+        .unwrap()
+        .await
+        .unwrap();
     let session = Session::new(conn);
     let (mut tx, mut rx) = session
         .open_control::<ViewerCommand, HostEvent>()
@@ -98,14 +107,19 @@ async fn video_over_loopback_keeps_frames_intact_and_fast() {
     })
     .await
     .unwrap();
-    assert!(matches!(rx.recv().await.unwrap(), HostEvent::Welcome { .. }));
+    assert!(matches!(
+        rx.recv().await.unwrap(),
+        HostEvent::Welcome { .. }
+    ));
 
     // Đồng bộ đồng hồ trước khi đo (cùng máy nên offset ~0, nhưng vẫn chạy
     // đúng luồng như thật).
     let mut clock = ClockSync::new();
     for _ in 0..5 {
         let sent = now_us();
-        tx.send(&ViewerCommand::Ping { sent_us: sent }).await.unwrap();
+        tx.send(&ViewerCommand::Ping { sent_us: sent })
+            .await
+            .unwrap();
         if let HostEvent::Pong { sent_us, host_us } = rx.recv().await.unwrap() {
             clock.on_pong(sent_us, host_us, now_us());
         }
@@ -159,10 +173,7 @@ async fn video_over_loopback_keeps_frames_intact_and_fast() {
         received as f32 >= FRAME_COUNT as f32 * 0.9,
         "mất quá nhiều frame: chỉ nhận {received}/{FRAME_COUNT}"
     );
-    assert!(
-        p50 < 50_000,
-        "độ trễ trung vị {p50}us quá cao cho loopback"
-    );
+    assert!(p50 < 50_000, "độ trễ trung vị {p50}us quá cao cho loopback");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

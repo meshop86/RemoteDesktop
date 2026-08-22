@@ -44,6 +44,8 @@ pub struct Peer {
     pub ip: String,
     pub os: String,
     pub online: bool,
+    /// "3 giờ trước" — chỉ có nghĩa với máy đang tắt. Rỗng nếu không rõ.
+    pub last_seen: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -52,6 +54,9 @@ pub struct Status {
     /// Địa chỉ của máy này trong tailnet — chính là thứ đọc cho người kia gõ.
     pub self_ip: Option<String>,
     pub self_name: String,
+    /// Chủ tài khoản của máy này. Dùng để biết máy gọi tới có cùng tài khoản
+    /// hay chỉ là khách được chia sẻ vào tailnet.
+    pub self_user_id: Option<u64>,
     pub peers: Vec<Peer>,
     /// Đường dẫn đăng nhập, khi Tailscale đang chờ người dùng mở trình duyệt.
     pub auth_url: Option<String>,
@@ -90,6 +95,17 @@ struct RawNode {
     os: Option<String>,
     #[serde(rename = "Online")]
     online: Option<bool>,
+    #[serde(rename = "UserID")]
+    user_id: Option<u64>,
+    /// Rỗng khi máy chưa từng nối; dùng để nói "tắt từ bao giờ".
+    #[serde(rename = "LastSeen")]
+    last_seen: Option<String>,
+    /// Địa chỉ thật đang gửi thẳng tới máy kia. Rỗng nghĩa là đang đi vòng.
+    #[serde(rename = "CurAddr")]
+    cur_addr: Option<String>,
+    /// Mã vùng DERP đang dùng để đi vòng, ví dụ `sin`.
+    #[serde(rename = "Relay")]
+    relay: Option<String>,
 }
 
 impl RawNode {
@@ -225,7 +241,9 @@ pub fn status() -> Status {
         Ok(raw) => raw,
         Err(err) => {
             return Status {
-                state: Some(State::Broken(format!("không hiểu JSON của tailscale: {err}"))),
+                state: Some(State::Broken(format!(
+                    "không hiểu JSON của tailscale: {err}"
+                ))),
                 ..Status::default()
             };
         }
@@ -249,6 +267,11 @@ pub fn status() -> Status {
                 ip: node.ipv4()?,
                 os: node.os.clone().unwrap_or_default(),
                 online: node.online.unwrap_or(false),
+                last_seen: node
+                    .last_seen
+                    .as_deref()
+                    .and_then(|text| khoang_cach(text, now_unix()))
+                    .unwrap_or_default(),
             })
         })
         .collect();
@@ -257,6 +280,7 @@ pub fn status() -> Status {
     Status {
         state: Some(state),
         self_ip: raw.self_node.as_ref().and_then(RawNode::ipv4),
+        self_user_id: raw.self_node.as_ref().and_then(|node| node.user_id),
         self_name: raw
             .self_node
             .as_ref()
@@ -265,6 +289,210 @@ pub fn status() -> Status {
         peers,
         auth_url: raw.auth_url.filter(|url| !url.is_empty()),
     }
+}
+
+/// Danh tính của một máy trong tailnet, tra từ địa chỉ `100.x.y.z`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Who {
+    /// Tên ngắn của máy, ví dụ `may-cua-toi`.
+    pub machine: String,
+    /// Tài khoản sở hữu máy đó, ví dụ `ai-do@gmail.com`.
+    pub login: String,
+    pub user_id: u64,
+    /// Nhãn ACL gắn cho máy (`tag:server`...). Máy gắn nhãn thuộc về nhãn chứ
+    /// không thuộc về người, nên `login` của nó là người đã gắn nhãn.
+    pub tags: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RawWhois {
+    #[serde(rename = "Node")]
+    node: Option<RawWhoisNode>,
+    #[serde(rename = "UserProfile")]
+    user: Option<RawUserProfile>,
+}
+
+#[derive(Deserialize)]
+struct RawWhoisNode {
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "Tags")]
+    tags: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct RawUserProfile {
+    #[serde(rename = "ID")]
+    id: Option<u64>,
+    #[serde(rename = "LoginName")]
+    login_name: Option<String>,
+}
+
+/// Dải địa chỉ Tailscale cấp cho máy trong tailnet (CGNAT, `100.64.0.0/10`).
+///
+/// Kiểm tra dải trước khi hỏi Tailscale để khỏi gọi tiến trình con cho mọi kết
+/// nối LAN — và để một địa chỉ ngoài dải không bao giờ đi được vào nhánh tin.
+pub fn is_tailnet_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            a == 100 && (64..128).contains(&b)
+        }
+        // `fd7a:115c:a1e0::/48` là dải ULA riêng của Tailscale.
+        std::net::IpAddr::V6(v6) => v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    }
+}
+
+/// Hỏi Tailscale xem địa chỉ này là máy nào, của ai. Lời gọi này **chặn**.
+pub fn whois(ip: std::net::IpAddr) -> Result<Who, String> {
+    let text = run(&["whois", "--json", &ip.to_string()])?;
+    let raw: RawWhois =
+        serde_json::from_str(&text).map_err(|err| format!("không hiểu JSON của whois: {err}"))?;
+    let node = raw
+        .node
+        .ok_or_else(|| "whois không trả về máy nào".to_string())?;
+    let user = raw
+        .user
+        .ok_or_else(|| "whois không trả về tài khoản".to_string())?;
+    Ok(Who {
+        machine: node
+            .name
+            .as_deref()
+            .and_then(|name| name.split('.').next())
+            .unwrap_or("?")
+            .to_owned(),
+        login: user.login_name.unwrap_or_default(),
+        user_id: user
+            .id
+            .ok_or_else(|| "whois thiếu mã tài khoản".to_string())?,
+        tags: node.tags.unwrap_or_default(),
+    })
+}
+
+/// Máy ở địa chỉ này có phải máy *của chính mình* trong tailnet không.
+///
+/// "Của chính mình" nghĩa là cùng tài khoản sở hữu, chứ không chỉ là cùng
+/// tailnet: tailnet có thể có khách được chia sẻ vào, và khách thì vẫn phải gõ
+/// mật khẩu như người lạ.
+///
+/// Lời gọi này **chặn** — chạy nó trên luồng nền.
+pub fn same_account(ip: std::net::IpAddr) -> Result<Who, String> {
+    if !is_tailnet_ip(ip) {
+        return Err(format!("{ip} không nằm trong dải Tailscale"));
+    }
+    let me = status();
+    if !me.running() {
+        return Err("Tailscale không chạy trên máy này".into());
+    }
+    let my_user = me
+        .self_user_id
+        .ok_or_else(|| "không biết máy này thuộc tài khoản nào".to_string())?;
+    let who = whois(ip)?;
+    // Máy gắn tag ACL không đứng tên người nào — Tailscale coi nó là thiết bị
+    // của tailnet chứ không của tài khoản, nên `UserID` không bao giờ khớp.
+    // Nói thẳng ra, không thì người dùng cứ tưởng mình cài sai.
+    if !who.tags.is_empty() {
+        return Err(format!(
+            "máy {} chạy dưới tag ACL ({}) nên không tính là cùng tài khoản; \
+             máy ấy phải gõ mật khẩu",
+            who.machine,
+            who.tags.join(", ")
+        ));
+    }
+    if who.user_id != my_user {
+        return Err(format!(
+            "máy {} thuộc tài khoản khác ({})",
+            who.machine, who.login
+        ));
+    }
+    Ok(who)
+}
+
+/// Đường mà Tailscale đang thực sự chuyển gói tới một máy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Path {
+    /// Gói đi thẳng máy nọ sang máy kia — nhanh nhất, đúng thứ ta cần cho video.
+    Direct(String),
+    /// Gói đi vòng qua máy chủ DERP của Tailscale. Chạy được ở mọi nơi nhưng
+    /// độ trễ cao hơn hẳn và băng thông bị chia sẻ, video sẽ giật.
+    Derp(String),
+}
+
+/// Hỏi Tailscale đang gửi tới `ip` bằng đường nào. Lời gọi này **chặn**.
+///
+/// Chỉ đúng khi hai máy đang thực sự trao đổi gói: lúc im lặng, Tailscale chưa
+/// chọn đường nào cả.
+pub fn path_to(ip: std::net::IpAddr) -> Option<Path> {
+    doc_duong_di(&run(&["status", "--json"]).ok()?, ip)
+}
+
+/// Phần đọc JSON của [`path_to`], tách ra để test khỏi cần Tailscale thật.
+fn doc_duong_di(text: &str, ip: std::net::IpAddr) -> Option<Path> {
+    let raw: RawStatus = serde_json::from_str(text).ok()?;
+    let dich = ip.to_string();
+    let node = raw
+        .peer?
+        .into_values()
+        .find(|node| node.ips.iter().flatten().any(|có| *có == dich))?;
+    match node.cur_addr.as_deref().unwrap_or("") {
+        "" => Some(Path::Derp(node.relay.unwrap_or_default())),
+        addr => Some(Path::Direct(addr.to_owned())),
+    }
+}
+
+/// Giây kể từ mốc Unix. Trả 0 nếu đồng hồ máy lùi trước 1970 — lúc đó mọi
+/// khoảng cách thời gian đều vô nghĩa, thà không hiện gì.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Đọc mốc thời gian RFC 3339 của Tailscale (`2026-08-22T00:10:00.1Z`) thành
+/// giây Unix. Chỉ nhận đúng dạng UTC mà Tailscale in ra, không cần tổng quát.
+fn doc_moc(text: &str) -> Option<i64> {
+    let (ngay, gio) = text.split_once('T')?;
+    let mut phan_ngay = ngay.split('-');
+    let nam: i64 = phan_ngay.next()?.parse().ok()?;
+    let thang: u32 = phan_ngay.next()?.parse().ok()?;
+    let ngay_trong_thang: i64 = phan_ngay.next()?.parse().ok()?;
+
+    let gio = gio.trim_end_matches('Z');
+    let gio = gio.split('.').next()?;
+    let mut phan_gio = gio.split(':');
+    let h: i64 = phan_gio.next()?.parse().ok()?;
+    let m: i64 = phan_gio.next()?.parse().ok()?;
+    let sec: i64 = phan_gio.next().unwrap_or("0").parse().ok()?;
+
+    Some(so_ngay(nam, thang, ngay_trong_thang) * 86_400 + h * 3_600 + m * 60 + sec)
+}
+
+/// Số ngày từ 1970-01-01 tới ngày cho trước (thuật toán lịch dân dụng của
+/// Howard Hinnant). Tự tính vì kéo cả một thư viện ngày tháng vào chỉ để hiện
+/// "3 giờ trước" thì không đáng.
+fn so_ngay(nam: i64, thang: u32, ngay: i64) -> i64 {
+    let nam = if thang <= 2 { nam - 1 } else { nam };
+    let ky = if nam >= 0 { nam } else { nam - 399 } / 400;
+    let nam_trong_ky = nam - ky * 400;
+    let thang = thang as i64;
+    let ngay_trong_nam = (153 * (if thang > 2 { thang - 3 } else { thang + 9 }) + 2) / 5 + ngay - 1;
+    let ngay_trong_ky = nam_trong_ky * 365 + nam_trong_ky / 4 - nam_trong_ky / 100 + ngay_trong_nam;
+    ky * 146_097 + ngay_trong_ky - 719_468
+}
+
+/// "5 phút trước", "3 giờ trước", "2 ngày trước". `None` nếu mốc không đọc được.
+fn khoang_cach(moc: &str, bay_gio: i64) -> Option<String> {
+    let truoc = bay_gio.checked_sub(doc_moc(moc)?)?;
+    if truoc < 0 {
+        return None;
+    }
+    Some(match truoc {
+        0..=89 => "vừa xong".to_string(),
+        90..=5399 => format!("{} phút trước", truoc / 60),
+        5400..=86_399 => format!("{} giờ trước", truoc / 3600),
+        _ => format!("{} ngày trước", truoc / 86_400),
+    })
 }
 
 /// Máy đang bật lên trước, rồi tới thứ tự tên: danh sách này để bấm chọn, mà
@@ -345,7 +573,10 @@ pub fn describe() -> String {
                 status.self_name,
                 status.self_ip.clone().unwrap_or_else(|| "?".into())
             ));
-            out.push_str(&format!("thấy {} máy khác trong tailnet", status.peers.len()));
+            out.push_str(&format!(
+                "thấy {} máy khác trong tailnet",
+                status.peers.len()
+            ));
         }
         State::NeedsLogin => out.push_str("chưa đăng nhập"),
         State::Stopped => out.push_str("dịch vụ nền chưa chạy"),
@@ -368,6 +599,10 @@ pub struct Watcher {
     message: Arc<Mutex<Option<String>>>,
     /// Lần cuối bắt đầu đi hỏi, để `tick` biết đã tới lượt chưa.
     last_poll: Mutex<Instant>,
+    /// Đánh thức giao diện khi luồng nền hỏi xong. Thiếu nó thì kết quả nằm im
+    /// tới lần người dùng động vào cửa sổ — đăng nhập xong mà màn hình vẫn ghi
+    /// "chưa đăng nhập" cho tới khi rê chuột.
+    repaint: Arc<std::sync::OnceLock<egui::Context>>,
 }
 
 impl Default for Watcher {
@@ -383,9 +618,17 @@ impl Watcher {
             busy: Arc::new(AtomicBool::new(false)),
             message: Arc::new(Mutex::new(None)),
             last_poll: Mutex::new(Instant::now()),
+            repaint: Arc::new(std::sync::OnceLock::new()),
         };
         watcher.refresh();
         watcher
+    }
+
+    /// Cho watcher đường đánh thức giao diện. Gọi mỗi khung hình cho gọn.
+    pub fn attach(&self, ctx: &egui::Context) {
+        if self.repaint.get().is_none() {
+            let _ = self.repaint.set(ctx.clone());
+        }
     }
 
     /// Hỏi lại nếu lần hỏi trước đã quá `every`.
@@ -404,7 +647,10 @@ impl Watcher {
 
     /// Bản chụp gần nhất. `state` là `None` khi lần hỏi đầu tiên chưa xong.
     pub fn snapshot(&self) -> Status {
-        self.status.lock().expect("khoá trạng thái tailscale").clone()
+        self.status
+            .lock()
+            .expect("khoá trạng thái tailscale")
+            .clone()
     }
 
     pub fn busy(&self) -> bool {
@@ -431,6 +677,7 @@ impl Watcher {
         let slot = self.status.clone();
         let busy = self.busy.clone();
         let message = self.message.clone();
+        let repaint = self.repaint.clone();
         let spawned = std::thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
@@ -438,6 +685,9 @@ impl Watcher {
                 *message.lock().expect("khoá lời nhắn") = note;
                 *slot.lock().expect("khoá trạng thái tailscale") = status();
                 busy.store(false, Ordering::Relaxed);
+                if let Some(ctx) = repaint.get() {
+                    ctx.request_repaint();
+                }
             });
         // Không tạo được luồng thì đừng kẹt cờ bận vĩnh viễn.
         if let Err(err) = spawned {
@@ -467,7 +717,9 @@ impl Watcher {
     /// Bật kết nối (`tailscale up`) cho máy đã đăng nhập nhưng đang tắt.
     pub fn up(&self) {
         self.spawn("rd-tailscale-up", || {
-            run(&["up"]).err().map(|err| format!("không bật được: {err}"))
+            run(&["up"])
+                .err()
+                .map(|err| format!("không bật được: {err}"))
         });
     }
 }
@@ -504,7 +756,77 @@ mod tests {
             ip: "100.0.0.1".into(),
             os: String::new(),
             online,
+            last_seen: String::new(),
         }
+    }
+
+    #[test]
+    fn phan_biet_noi_thang_va_di_vong_derp() {
+        let json = r#"{"Peer":{"k1":{"TailscaleIPs":["100.64.1.9"],"CurAddr":"203.0.113.7:41641","Relay":"sin"},
+                               "k2":{"TailscaleIPs":["100.64.1.10"],"CurAddr":"","Relay":"sin"}}}"#;
+        let thang = "100.64.1.9".parse().expect("ip hợp lệ");
+        let vong = "100.64.1.10".parse().expect("ip hợp lệ");
+        let la = "100.64.1.11".parse().expect("ip hợp lệ");
+        assert!(
+            matches!(doc_duong_di(json, thang), Some(Path::Direct(addr)) if addr == "203.0.113.7:41641")
+        );
+        assert!(matches!(doc_duong_di(json, vong), Some(Path::Derp(vung)) if vung == "sin"));
+        // Máy lạ thì im lặng, không đoán bừa là đang đi vòng.
+        assert!(doc_duong_di(json, la).is_none());
+    }
+
+    #[test]
+    fn doc_duoc_moc_thoi_gian_cua_tailscale() {
+        assert_eq!(doc_moc("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(doc_moc("2026-08-22T00:10:00.1Z"), Some(1_787_357_400));
+        // Năm nhuận và ngày ngay sau tháng 2 là chỗ thuật toán lịch hay sai.
+        assert_eq!(doc_moc("2000-02-29T12:00:00Z"), Some(951_825_600));
+        assert_eq!(doc_moc("1972-03-01T00:00:00Z"), Some(68_256_000));
+        assert_eq!(doc_moc("rác"), None);
+    }
+
+    #[test]
+    fn khoang_cach_noi_tieng_viet() {
+        let moc = "2026-08-22T00:00:00Z";
+        let goc = doc_moc(moc).unwrap();
+        assert_eq!(khoang_cach(moc, goc + 30).as_deref(), Some("vừa xong"));
+        assert_eq!(
+            khoang_cach(moc, goc + 600).as_deref(),
+            Some("10 phút trước")
+        );
+        assert_eq!(
+            khoang_cach(moc, goc + 10_800).as_deref(),
+            Some("3 giờ trước")
+        );
+        assert_eq!(
+            khoang_cach(moc, goc + 172_800).as_deref(),
+            Some("2 ngày trước")
+        );
+        // Đồng hồ hai máy lệch nhau thì thà không hiện còn hơn hiện "âm".
+        assert_eq!(khoang_cach(moc, goc - 60), None);
+    }
+
+    #[test]
+    fn dai_dia_chi_tailscale() {
+        assert!(is_tailnet_ip("100.68.186.31".parse().unwrap()));
+        assert!(is_tailnet_ip("100.64.0.1".parse().unwrap()));
+        assert!(is_tailnet_ip("fd7a:115c:a1e0::1".parse().unwrap()));
+        assert!(!is_tailnet_ip("100.63.255.255".parse().unwrap()));
+        assert!(!is_tailnet_ip("100.128.0.1".parse().unwrap()));
+        assert!(!is_tailnet_ip("192.168.1.5".parse().unwrap()));
+        assert!(!is_tailnet_ip("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn doc_duoc_whois() {
+        let raw: RawWhois = serde_json::from_str(
+            r#"{"Node":{"Name":"may-a.tail1.ts.net.","Tags":["tag:server"]},
+                 "UserProfile":{"ID":42,"LoginName":"toi@vidu.com"}}"#,
+        )
+        .expect("đọc được whois");
+        let node = raw.node.unwrap();
+        assert_eq!(node.name.unwrap().split('.').next(), Some("may-a"));
+        assert_eq!(raw.user.unwrap().id, Some(42));
     }
 
     #[test]

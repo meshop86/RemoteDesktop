@@ -161,7 +161,7 @@ where
         .ok_or_else(|| TransportError::BadFileName(offer.name.clone()))?;
     tokio::fs::create_dir_all(dest_dir).await?;
 
-    let partial = dest_dir.join(format!(".rd-partial-{:016x}", offer.transfer_id));
+    let partial = partial_path(dest_dir, offer.transfer_id);
     let mut file = tokio::fs::File::create(&partial).await?;
 
     let result = drain(&mut stream, &mut file, offer, &mut progress).await;
@@ -178,6 +178,14 @@ where
     let final_path = unique_path(dest_dir, &name).await;
     tokio::fs::rename(&partial, &final_path).await?;
     Ok(final_path)
+}
+
+/// Tên file tạm của một lần nhận đang dở.
+///
+/// Công khai vì người huỷ giữa chừng phải dọn được nó: lúc ấy [`recv_file`] bị
+/// cắt ngang giữa hai lần `await` nên chính nó không chạy tới đoạn dọn dẹp.
+pub fn partial_path(dest_dir: &Path, transfer_id: u64) -> PathBuf {
+    dest_dir.join(format!(".rd-partial-{transfer_id:016x}"))
 }
 
 /// Bơm dữ liệu từ stream xuống file, vừa bơm vừa băm và đếm.
@@ -300,8 +308,14 @@ mod tests {
     #[test]
     fn strips_directory_from_both_platforms() {
         assert_eq!(safe_file_name("/etc/passwd").unwrap(), "passwd");
-        assert_eq!(safe_file_name(r"C:\Windows\system32\cmd.exe").unwrap(), "cmd.exe");
-        assert_eq!(safe_file_name("../../.ssh/authorized_keys").unwrap(), "authorized_keys");
+        assert_eq!(
+            safe_file_name(r"C:\Windows\system32\cmd.exe").unwrap(),
+            "cmd.exe"
+        );
+        assert_eq!(
+            safe_file_name("../../.ssh/authorized_keys").unwrap(),
+            "authorized_keys"
+        );
         assert_eq!(safe_file_name(r"..\..\evil.dll").unwrap(), "evil.dll");
     }
 

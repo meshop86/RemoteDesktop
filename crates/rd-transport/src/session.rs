@@ -5,7 +5,8 @@ use std::{marker::PhantomData, net::SocketAddr, time::Duration};
 use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendStream};
 use rd_protocol::{
-    AssembledFrame, FrameAssembler, assembler::AssemblerStats, control::Codec, video::fragment_frame,
+    AssembledFrame, FrameAssembler, MAX_VIDEO_PAYLOAD, VIDEO_HEADER_LEN, assembler::AssemblerStats,
+    control::Codec, video::fragment_frame,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -14,6 +15,10 @@ use crate::TransportError;
 /// Trần kích thước một control message. Chat và metadata file đều rất nhỏ;
 /// giới hạn này chỉ để chặn đầu kia gửi độ dài rác làm ta cấp phát khổng lồ.
 pub const MAX_CONTROL_MESSAGE: usize = 1024 * 1024;
+
+/// Nhãn của chuỗi ràng buộc kênh. Đổi nhãn là đổi chuỗi, nên hai đầu phải
+/// giống hệt nhau — sửa ở đây thì phải nâng `PROTOCOL_VERSION`.
+const CHANNEL_BINDING_LABEL: &[u8] = b"rd-auth-v1";
 
 #[derive(Clone)]
 pub struct Session {
@@ -31,6 +36,35 @@ impl Session {
 
     pub fn remote_address(&self) -> SocketAddr {
         self.conn.remote_address()
+    }
+
+    /// Ba mươi hai byte chỉ đúng kết nối TLS này mới có.
+    ///
+    /// Hai đầu của *cùng một* kết nối tính ra cùng một chuỗi, hai kết nối khác
+    /// nhau thì không bao giờ trùng (RFC 5705). Dùng nó trộn vào mật khẩu là
+    /// kẻ đứng giữa có bắt được lời chào cũng vô dụng: hắn đang ngồi trên hai
+    /// kết nối khác nhau, mỗi bên một chuỗi, nên không phát lại sang bên kia
+    /// được.
+    pub fn channel_binding(&self) -> Result<[u8; 32], TransportError> {
+        let mut out = [0u8; 32];
+        self.conn
+            .export_keying_material(&mut out, CHANNEL_BINDING_LABEL, b"")
+            .map_err(|_| TransportError::Tls("không lấy được ràng buộc kênh".into()))?;
+        Ok(out)
+    }
+
+    /// Vân tay chứng chỉ mà đầu kia vừa dùng để bắt tay.
+    ///
+    /// Viewer lưu con số này lại sau lần nối đầu tiên rồi ghim từ lần sau
+    /// (xem [`crate::client_config_for`]). Phía host luôn trả `None` vì viewer
+    /// không xuất trình chứng chỉ nào.
+    pub fn peer_fingerprint(&self) -> Option<[u8; 32]> {
+        let certs = self
+            .conn
+            .peer_identity()?
+            .downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
+            .ok()?;
+        certs.first().map(|cert| crate::tls::fingerprint_of(cert))
     }
 
     pub fn close(&self, reason: &str) {
@@ -147,7 +181,35 @@ impl VideoSender {
         let frame_id = self.frame_id;
         self.frame_id = self.frame_id.wrapping_add(1);
 
-        let packets = fragment_frame(encoded, frame_id, self.monitor, codec, keyframe, capture_us);
+        // Hỏi lại mỗi frame: quinn cập nhật con số này khi đường truyền đổi.
+        let max_payload = self
+            .session
+            .conn
+            .max_datagram_size()
+            .map(|size| size.saturating_sub(VIDEO_HEADER_LEN))
+            .filter(|payload| *payload > 0)
+            .unwrap_or(MAX_VIDEO_PAYLOAD);
+        // Một frame chỉ dùng được khi *đủ* mảnh. Bắn nửa frame vào một hàng
+        // đợi sắp đầy là vừa phí băng thông vừa chiếm chỗ của frame kế tiếp —
+        // frame đó mới là frame viewer thật sự cần. Không đủ chỗ thì bỏ cả
+        // frame ngay từ đầu, coi như frame này chưa từng tồn tại.
+        let fragments = encoded.len().div_ceil(max_payload).max(1);
+        let needed = encoded.len() + fragments * VIDEO_HEADER_LEN;
+        if self.session.conn.datagram_send_buffer_space() < needed {
+            self.dropped_frames += 1;
+            tracing::debug!(frame_id, needed, "bỏ frame vì hàng đợi datagram sắp đầy");
+            return Ok(0);
+        }
+
+        let packets = fragment_frame(
+            encoded,
+            frame_id,
+            self.monitor,
+            codec,
+            keyframe,
+            capture_us,
+            max_payload,
+        );
         let total = packets.len();
         for packet in packets {
             match self.session.conn.send_datagram(packet) {

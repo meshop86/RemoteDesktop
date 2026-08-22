@@ -280,12 +280,14 @@ impl Drop for CgInjector {
 
 /// Kích thước màn hình chính, tính bằng pixel.
 pub fn main_screen_geometry() -> Result<ScreenGeometry> {
-    use objc2_core_graphics::{CGMainDisplayID, CGDisplayPixelsHigh, CGDisplayPixelsWide};
+    use objc2_core_graphics::{CGDisplayPixelsHigh, CGDisplayPixelsWide, CGMainDisplayID};
     let display = CGMainDisplayID();
     let width = CGDisplayPixelsWide(display) as f32;
     let height = CGDisplayPixelsHigh(display) as f32;
     if width <= 0.0 || height <= 0.0 {
-        return Err(InputError::Platform("không đọc được kích thước màn hình".into()));
+        return Err(InputError::Platform(
+            "không đọc được kích thước màn hình".into(),
+        ));
     }
-    Ok(ScreenGeometry { width, height })
+    Ok(ScreenGeometry::new(width, height))
 }

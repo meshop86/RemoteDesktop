@@ -6,8 +6,8 @@
 //! chờ nhau vĩnh viễn. Vì thế `Hello` phải đi ngay sau khi mở kênh.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -37,6 +37,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Sâu 2: một frame đang giải mã, một frame đợi. Dồn thêm chỉ tổ tích độ trễ —
 /// frame thứ ba luôn tới muộn hơn thời điểm nó còn có ích.
 const DECODE_QUEUE: usize = 2;
+
+/// Số lần dựng lại bộ giải mã trước khi chịu thua và cho phiên rớt.
+const MAX_DECODER_RESTARTS: u32 = 5;
+
+/// Sau chừng này mà không phải dựng lại lần nữa thì coi sự cố cũ đã qua.
+const RESTART_WINDOW: Duration = Duration::from_secs(60);
 
 pub struct ViewerWire;
 
@@ -68,6 +74,10 @@ impl Wire for ViewerWire {
         ViewerCommand::FileReject { transfer_id }
     }
 
+    fn cancel(transfer_id: u64) -> ViewerCommand {
+        ViewerCommand::FileCancel { transfer_id }
+    }
+
     fn ack(ack: FileChunkAck) -> ViewerCommand {
         ViewerCommand::FileChunkAck(ack)
     }
@@ -82,6 +92,10 @@ impl Wire for ViewerWire {
 
     fn quality(request: QualityRequest) -> Option<ViewerCommand> {
         Some(ViewerCommand::SetQuality(request))
+    }
+
+    fn select_monitor(monitor: u8) -> Option<ViewerCommand> {
+        Some(ViewerCommand::SelectMonitor { monitor })
     }
 
     fn ping(sent_us: u64) -> Option<ViewerCommand> {
@@ -99,6 +113,7 @@ impl Wire for ViewerWire {
             HostEvent::FileOffer(offer) => Incoming::Offer(offer),
             HostEvent::FileAccept { transfer_id } => Incoming::Accept(transfer_id),
             HostEvent::FileReject { transfer_id } => Incoming::Reject(transfer_id),
+            HostEvent::FileCancel { transfer_id } => Incoming::Cancel(transfer_id),
             HostEvent::FileChunkAck(ack) => Incoming::Ack(ack),
             HostEvent::Pong { sent_us, host_us } => Incoming::Pong { sent_us, host_us },
             HostEvent::Error { message } => Incoming::Error(message),
@@ -109,9 +124,59 @@ impl Wire for ViewerWire {
     }
 }
 
+/// Nối lại sau khi đứt: lần đầu chờ ngần này, mỗi lần hỏng tiếp thì gấp đôi.
+const RECONNECT_START: Duration = Duration::from_secs(1);
+
+/// Trần của phép gấp đôi. Host mất điện có thể mất vài phút mới lên lại, nhưng
+/// khi nó lên rồi thì không ai muốn chờ thêm nửa phút nữa mới có hình.
+const RECONNECT_MAX: Duration = Duration::from_secs(15);
+
 pub async fn run(
     ctx: Arc<Context>,
     mut commands: UnboundedReceiver<UiCommand>,
+) -> anyhow::Result<()> {
+    let mut wait = RECONNECT_START;
+    loop {
+        let started = std::time::Instant::now();
+        let outcome = session_once(&ctx, &mut commands).await;
+        let err = match outcome {
+            // Host chào tạm biệt, hoặc giao diện đã đóng: hết việc thật.
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+        if fatal(&err) {
+            return Err(err);
+        }
+
+        // Nối được và chạy được một lúc thì lần đứt này là sự cố mới, không
+        // phải lần thử hỏng nối tiếp — đếm lại từ đầu.
+        if started.elapsed() >= Duration::from_secs(30) {
+            wait = RECONNECT_START;
+        }
+        ctx.events.send(NetEvent::PeerLeft);
+        ctx.events
+            .status(format!("mất kết nối ({err:#}), thử lại sau {wait:?}"));
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(RECONNECT_MAX);
+    }
+}
+
+/// Lỗi mà thử lại bao nhiêu lần cũng thế: sai mật khẩu, lệch phiên bản, hoặc
+/// địa chỉ gõ sai. Báo thẳng cho người dùng thay vì thử lại âm thầm mãi.
+fn fatal(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    [
+        "sai mật khẩu",
+        "phiên bản giao thức",
+        "chưa cho biết nối tới đâu",
+    ]
+    .iter()
+    .any(|mark| text.contains(mark))
+}
+
+async fn session_once(
+    ctx: &Arc<Context>,
+    commands: &mut UnboundedReceiver<UiCommand>,
 ) -> anyhow::Result<()> {
     let peer = ctx
         .config
@@ -122,8 +187,8 @@ pub async fn run(
     // `_relay` phải sống bằng tuổi thọ phiên: nó sở hữu endpoint mà kết nối
     // đang chạy trên đó.
     let (session, relayed, _relay) = match peer {
-        PeerAddress::Direct(addr) => (connect_direct(&ctx, addr).await?, false, None),
-        PeerAddress::Code(code) => connect_via_rendezvous(&ctx, code).await?,
+        PeerAddress::Direct(addr) => (connect_direct(ctx, addr).await?, false, None),
+        PeerAddress::Code(code) => connect_via_rendezvous(ctx, code).await?,
     };
 
     let (mut tx, mut rx) = session.open_control::<ViewerCommand, HostEvent>().await?;
@@ -136,18 +201,22 @@ pub async fn run(
     tx.send(&ViewerCommand::Hello {
         version: rd_protocol::PROTOCOL_VERSION,
         viewer_name: ctx.config.name.clone(),
-        auth: ctx.auth(),
+        auth: ctx.auth(&session)?,
         wants_10bit: ctx.config.allow_10bit,
         codecs,
     })
     .await?;
 
-    let (host_name, info) = handshake(&mut rx).await?;
+    let (host_name, info) = handshake(ctx, &mut rx).await?;
     ctx.events.send(NetEvent::Connected {
         peer: session.remote_address(),
         name: host_name,
         relayed,
     });
+    // Giữ tới hết phiên: thả sớm là task bị huỷ trước khi kịp báo.
+    let _duong = super::bao_duong_di(ctx.events.clone(), session.remote_address().ip(), None);
+    // Có host rồi thì clipboard mới được phép chảy sang.
+    let _clipboard = ctx.config.clipboard.session_guard();
     ctx.events.send(NetEvent::Info(Box::new(info.clone())));
 
     let clock = Arc::new(Mutex::new(ClockSync::new()));
@@ -165,15 +234,12 @@ pub async fn run(
 
     let mut video = video;
     tokio::select! {
-        result = link::run::<ViewerWire>(ctx.clone(), session.clone(), tx, rx, &mut commands, hooks) => result,
+        result = link::run::<ViewerWire>(ctx.clone(), session.clone(), tx, rx, commands, hooks) => result,
         result = &mut video.0 => result?,
     }
 }
 
-async fn connect_direct(
-    ctx: &Arc<Context>,
-    addr: std::net::SocketAddr,
-) -> anyhow::Result<Session> {
+async fn connect_direct(ctx: &Arc<Context>, addr: std::net::SocketAddr) -> anyhow::Result<Session> {
     ctx.events.status(format!("đang nối tới {addr}"));
     let endpoint = client_endpoint(ctx.config.bind, ctx.config.peer_fingerprint)
         .context("không mở được cổng UDP")?;
@@ -238,6 +304,7 @@ async fn connect_via_rendezvous(
 /// Foundation phải biết trước khi dựng), QualityChanged mang codec và mức lấy
 /// mẫu màu *thật* mà bộ mã hoá chốt được — không phải mức ta yêu cầu.
 async fn handshake(
+    ctx: &Arc<Context>,
     rx: &mut rd_transport::ControlReceiver<HostEvent>,
 ) -> anyhow::Result<(String, PipelineInfo)> {
     let mut host_name = None;
@@ -266,17 +333,27 @@ async fn handshake(
                     .find(|m| m.id == active_monitor)
                     .or_else(|| monitors.first())
                     .context("host không khai màn hình nào")?;
-                size = Some((monitor.name.clone(), monitor.width, monitor.height));
+                size = Some((
+                    monitor.name.clone(),
+                    monitor.width,
+                    monitor.height,
+                    monitor.id,
+                ));
+                ctx.events.send(NetEvent::Monitors {
+                    active: monitor.id,
+                    list: monitors.clone(),
+                });
                 fps = monitor.refresh_hz.max(1);
                 host_name = Some(name);
             }
             HostEvent::QualityChanged(quality) => {
-                let (source, width, height) = size
+                let (source, width, height, display_id) = size
                     .clone()
                     .context("host gửi QualityChanged trước Welcome")?;
                 return Ok((
                     host_name.unwrap_or_default(),
                     PipelineInfo {
+                        display_id: display_id as u32,
                         source,
                         width,
                         height,
@@ -302,10 +379,11 @@ async fn video_loop(
     info: PipelineInfo,
     clock: Arc<Mutex<ClockSync>>,
 ) -> anyhow::Result<()> {
-    let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<AssembledFrame>(DECODE_QUEUE);
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
-    spawn_decoder(ctx.clone(), info, clock, raw_rx, ready_tx)?;
-    ready_rx.await.context("luồng giải mã chết khi khởi động")??;
+    let mut sender = start_decoder(&ctx, &info, &clock).await?;
+    // Đếm số lần phải dựng lại bộ giải mã. Nếu lần dựng gần nhất đã lâu thì
+    // coi như sự cố cũ đã qua và đếm lại từ đầu.
+    let mut restarts = 0u32;
+    let mut last_restart: Option<std::time::Instant> = None;
 
     let mut receiver = VideoReceiver::new(session, 4);
     // Id của frame cuối cùng thực sự tới được bộ giải mã. Mọi khoảng trống ở
@@ -316,7 +394,7 @@ async fn video_loop(
         let frame = receiver.next_frame().await?;
         let frame_id = frame.frame_id;
         let keyframe = frame.keyframe;
-        match raw_tx.try_send(frame) {
+        match sender.try_send(frame) {
             Ok(()) => {
                 let gap = last_id.is_some_and(|last| frame_id != last.wrapping_add(1));
                 last_id = Some(frame_id);
@@ -328,11 +406,47 @@ async fn video_loop(
             // Giải mã không theo kịp. Bỏ frame là đúng: giữ lại chỉ làm mọi
             // frame sau đó đến muộn thêm.
             Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+            // Luồng giải mã chết giữa chừng. Cắt cả phiên vì thế là phản
+            // ứng quá tay: người dùng mất luôn chuột, bàn phím và file đang
+            // truyền, trong khi dựng lại bộ giải mã chỉ tốn vài trăm mili giây.
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                anyhow::bail!("luồng giải mã đã dừng")
+                if ctx.stop.load(Ordering::Relaxed) {
+                    anyhow::bail!("ứng dụng đang đóng");
+                }
+                if last_restart.is_some_and(|luc| luc.elapsed() > RESTART_WINDOW) {
+                    restarts = 0;
+                }
+                restarts += 1;
+                last_restart = Some(std::time::Instant::now());
+                if restarts > MAX_DECODER_RESTARTS {
+                    anyhow::bail!("luồng giải mã dừng {restarts} lần liên tiếp");
+                }
+                tracing::warn!(restarts, "luồng giải mã đã dừng, đang dựng lại");
+                ctx.events
+                    .status(format!("bộ giải mã dừng, đang dựng lại (lần {restarts})"));
+                sender = start_decoder(&ctx, &info, &clock).await?;
+                last_id = None;
+                // Bộ giải mã mới chưa có khung tham chiếu nào: không xin
+                // keyframe thì màn hình đứng im tới keyframe định kỳ kế tiếp.
+                ctx.force_keyframe();
             }
         }
     }
+}
+
+/// Dựng luồng giải mã và chờ nó báo đã sẵn sàng.
+async fn start_decoder(
+    ctx: &Arc<Context>,
+    info: &PipelineInfo,
+    clock: &Arc<Mutex<ClockSync>>,
+) -> anyhow::Result<std::sync::mpsc::SyncSender<AssembledFrame>> {
+    let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<AssembledFrame>(DECODE_QUEUE);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+    spawn_decoder(ctx.clone(), info.clone(), clock.clone(), raw_rx, ready_tx)?;
+    ready_rx
+        .await
+        .context("luồng giải mã chết khi khởi động")??;
+    Ok(raw_tx)
 }
 
 fn spawn_decoder(
@@ -356,8 +470,13 @@ fn spawn_decoder(
                 }
             };
 
+            // Mọi lối ra đều phải có tên. Trước đây luồng này thoát im lặng
+            // và phía kia chỉ thấy "kênh đã đóng" — không đủ để biết vì sao.
             let mut errors = 0u32;
-            while let Ok(frame) = frames.recv() {
+            let ly_do = loop {
+                let Ok(frame) = frames.recv() else {
+                    break "phần mạng đã đóng kênh frame";
+                };
                 // `encode_us` không đi trên dây — thêm nó vào mỗi datagram để
                 // hiện một con số chẩn đoán là không đáng. HUD hiện "—".
                 match sink.decode(&frame.data, frame.capture_us, 0, frame.keyframe) {
@@ -365,11 +484,13 @@ fn spawn_decoder(
                         errors = 0;
                         // Hai máy hai đồng hồ: hiệu số thô vô nghĩa. Chỉ khi
                         // đã có mẫu ping mới quy đổi được về độ trễ thật.
-                        if let Some(latency) = clock
-                            .lock()
-                            .expect("khoá đồng hồ")
-                            .latency_us(frame.capture_us, now_us())
-                        {
+                        // Khoá hỏng vì luồng khác panic thì chỉ mất con số độ
+                        // trễ; hình vẫn phải chạy tiếp, không được panic theo.
+                        let latency = match clock.lock() {
+                            Ok(dong_ho) => dong_ho.latency_us(frame.capture_us, now_us()),
+                            Err(_) => None,
+                        };
+                        if let Some(latency) = latency {
                             item.pipeline_us = latency.max(0) as u32;
                         }
                         ctx.push_frame(item);
@@ -386,14 +507,15 @@ fn spawn_decoder(
                         tracing::warn!(%err, errors, "giải mã lỗi");
                         if errors >= 60 {
                             ctx.events.status(format!("dừng giải mã: {err}"));
-                            break;
+                            break "quá nhiều lỗi giải mã liên tiếp";
                         }
                     }
                 }
                 if ctx.stop.load(Ordering::Relaxed) {
-                    break;
+                    break "ứng dụng yêu cầu dừng";
                 }
-            }
+            };
+            tracing::info!(ly_do, "luồng giải mã kết thúc");
         })
         .context("không tạo được luồng giải mã")?;
     Ok(())

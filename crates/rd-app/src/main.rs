@@ -29,6 +29,7 @@
 mod app;
 mod net;
 mod os;
+mod probe;
 mod session;
 mod tailscale;
 mod ui;
@@ -193,9 +194,19 @@ fn show_error(_text: &str) {}
 /// Cho mọi cú panic hiện ra thành hộp thoại, không chỉ nằm im trong log.
 fn install_panic_hook(log: Option<PathBuf>) {
     let truoc = std::panic::take_hook();
+    // Chỉ luồng chính mới đáng bật hộp thoại. Luồng phụ (giải mã, mạng) chết
+    // là chuyện phục hồi được — dựng lại là xong — mà hộp thoại thì chặn luôn
+    // luồng đó lại, khiến chỗ gọi không bao giờ biết nó đã chết.
+    let luong_chinh = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
-        // Vẫn để cách báo lỗi mặc định chạy: nó in ra stderr và vào file log.
+        // Vẫn để cách báo lỗi mặc định chạy: nó in ra stderr.
         truoc(info);
+        // Nhưng stderr không có ai đọc khi chạy không console, nên chép lại
+        // qua tracing để cú panic nằm luôn trong file nhật ký.
+        tracing::error!("panic: {info}");
+        if std::thread::current().id() != luong_chinh {
+            return;
+        }
         let mut text = format!("Chương trình gặp lỗi và phải dừng.\n\n{info}");
         if let Some(path) = &log {
             text.push_str(&format!("\n\nNhật ký: {}", path.display()));
@@ -230,6 +241,13 @@ fn main() {
     }
     if args.probe {
         println!("{}", app::probe());
+        return;
+    }
+    if args.selftest {
+        // Mã thoát khác 0 để chạy trong script cũng biết đường mà dừng.
+        if !os::selftest() {
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -283,7 +301,10 @@ fn doc_dau() -> Vec<String> {
 fn run(args: app::Args, tranh: Vec<String>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
+            // Vừa đủ cho màn hình đầu và trang cài đặt. Vào phiên xem màn
+            // hình thì người dùng phóng to hoặc bấm F11; mở sẵn một cửa sổ
+            // 1280x800 gần như trống thì lần nào cũng phải thu nhỏ lại.
+            .with_inner_size([1000.0, 500.0])
             .with_min_inner_size([720.0, 460.0])
             .with_title("Điều khiển từ xa"),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {

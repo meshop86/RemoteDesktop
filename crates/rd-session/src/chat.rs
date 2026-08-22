@@ -102,15 +102,15 @@ fn clean(body: &str) -> Option<String> {
         .filter(|c| *c == '\n' || !c.is_control())
         .collect();
     truncate_bytes(&mut out, MAX_CHAT_BODY);
-    if out.trim().is_empty() { None } else { Some(out) }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 fn clean_name(from: &str) -> String {
-    let mut name: String = from
-        .trim()
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect();
+    let mut name: String = from.trim().chars().filter(|c| !c.is_control()).collect();
     truncate_bytes(&mut name, 64);
     if name.is_empty() {
         "?".to_string()

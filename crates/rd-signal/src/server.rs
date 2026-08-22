@@ -52,6 +52,15 @@ impl RendezvousServer {
     /// giữa giả làm rendezvous server.
     pub fn bind(bind: SocketAddr) -> crate::Result<Self> {
         let identity: SelfSignedIdentity = rd_transport::generate_self_signed("rd-rendezvous")?;
+        Self::bind_with_identity(bind, identity)
+    }
+
+    /// Như [`RendezvousServer::bind`] nhưng dùng chứng chỉ có sẵn, để vân tay
+    /// không đổi sau mỗi lần khởi động lại — client mới ghim được nó.
+    pub fn bind_with_identity(
+        bind: SocketAddr,
+        identity: SelfSignedIdentity,
+    ) -> crate::Result<Self> {
         let fingerprint = identity.fingerprint;
         let config = rd_transport::server_config_for(&identity, SIGNAL_ALPN)?;
         let endpoint = Endpoint::server(config, bind)?;

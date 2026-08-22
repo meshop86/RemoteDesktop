@@ -21,18 +21,18 @@ use std::time::{Duration, Instant};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize,
-    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI,
-    IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform,
-    MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, METransformDrainComplete, METransformHaveOutput,
-    METransformNeedInput, MF_EVENT_TYPE, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK,
-    MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
-    MFMediaType_Video, MFSampleExtension_CleanPoint, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN,
-    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFDXGIDeviceManager,
+    IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform, METransformDrainComplete,
+    METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT,
+    MF_EVENT_TYPE, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MFCreateDXGISurfaceBuffer,
+    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
+    MFSampleExtension_CleanPoint, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFVideoFormat_H264,
     MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
     eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_High,
@@ -58,6 +58,10 @@ const SQUARE_PIXELS: u64 = attribute_pair(1, 1);
 /// cứng, không đủ để một MFT đã kẹt ăn hết VRAM.
 const MAX_PENDING: usize = 4;
 
+/// Nhịp hỏi lại hàng đợi sự kiện của MFT khi đang rỗng. 1 ms là dưới ngưỡng
+/// một frame ở 60 fps (16 ms) nên không thêm độ trễ đo được.
+const EVENT_POLL: Duration = Duration::from_millis(1);
+
 #[derive(Default)]
 struct Counters {
     submitted: AtomicU64,
@@ -78,7 +82,9 @@ struct Job {
 struct Pipeline {
     transform: IMFTransform,
     codec_api: Option<ICodecAPI>,
-    codec: Codec,
+    /// Giữ cả cấu hình chứ không riêng codec: khi MFT đòi thoả thuận lại kiểu
+    /// đầu ra ta phải dựng lại đúng kiểu ấy từ đầu.
+    config: EncoderConfig,
     /// Số lời mời `NeedInput` chưa dùng. MFT phần cứng thường mời trước vài
     /// frame để lấp ống dẫn của nó.
     credits: u32,
@@ -175,7 +181,7 @@ impl MfEncoder {
             pipeline: Mutex::new(Pipeline {
                 transform,
                 codec_api,
-                codec: config.codec,
+                config: config.clone(),
                 credits: 0,
                 pending: VecDeque::new(),
                 submitted_at: HashMap::new(),
@@ -265,7 +271,10 @@ impl MfEncoder {
                 self.shared.counters.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.shared.counters.submitted.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .counters
+            .submitted
+            .fetch_add(1, Ordering::Relaxed);
         pipeline.feed(&self.shared.counters);
         Ok(())
     }
@@ -313,7 +322,9 @@ impl Drop for MfEncoder {
                 // Thứ tự này quan trọng: `FLUSH` vứt frame đang dở và làm mọi
                 // lời gọi đang treo trả về, `END_STREAMING` mới khiến hàng đợi
                 // sự kiện đóng lại để luồng pump thoát.
-                let _ = pipeline.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+                let _ = pipeline
+                    .transform
+                    .ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
                 let _ = pipeline
                     .transform
                     .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
@@ -337,7 +348,9 @@ impl Pipeline {
             };
             self.credits -= 1;
 
-            if job.force_key && let Some(api) = &self.codec_api {
+            if job.force_key
+                && let Some(api) = &self.codec_api
+            {
                 let value = VARIANT::from(1u32);
                 if let Err(err) = unsafe { api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &value) }
                 {
@@ -366,10 +379,9 @@ impl Pipeline {
 
     /// Bọc texture NV12 thành `IMFSample` mà không chép pixel.
     fn wrap(&self, job: &Job) -> Result<IMFSample> {
-        let buffer = unsafe {
-            MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &job.texture, 0, false)
-        }
-        .map_err(|err| system("bọc texture thành media buffer", err))?;
+        let buffer =
+            unsafe { MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &job.texture, 0, false) }
+                .map_err(|err| system("bọc texture thành media buffer", err))?;
 
         // Buffer sinh từ texture có `CurrentLength` bằng 0; MFT bỏ qua sample
         // rỗng nên phải đặt bằng đúng kích thước liên tục của ảnh.
@@ -379,8 +391,7 @@ impl Pipeline {
             let _ = unsafe { buffer.SetCurrentLength(length) };
         }
 
-        let sample =
-            unsafe { MFCreateSample() }.map_err(|err| system("tạo sample", err))?;
+        let sample = unsafe { MFCreateSample() }.map_err(|err| system("tạo sample", err))?;
         unsafe {
             sample
                 .AddBuffer(&buffer)
@@ -451,9 +462,31 @@ impl Pipeline {
         }
     }
 
-    fn process_output(&self) -> Result<Option<IMFSample>> {
-        let info = unsafe { self.transform.GetOutputStreamInfo(0) }
-            .map_err(|err| system("hỏi thông tin luồng ra", err))?;
+    /// Lấy sample nén ra, xử lý hai lời từ chối *bình thường* của MFT:
+    ///
+    /// * `NEED_MORE_INPUT`: chưa đủ frame để ra hình — không phải lỗi.
+    /// * `STREAM_CHANGE`: MFT đổi kiểu đầu ra và **không ra được frame nào**
+    ///   cho tới khi ta thoả thuận lại. MFT của Intel làm việc này ngay ở frame
+    ///   đầu tiên; coi nó là lỗi thì màn hình bên kia đen vĩnh viễn.
+    fn process_output(&mut self) -> Result<Option<IMFSample>> {
+        match self.try_process_output() {
+            Ok(sample) => Ok(sample),
+            Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(None),
+            Err(err) if err.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                self.renegotiate_output()?;
+                match self.try_process_output() {
+                    Ok(sample) => Ok(sample),
+                    Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(None),
+                    Err(err) => Err(system("lấy dữ liệu nén ra khỏi MFT", err)),
+                }
+            }
+            Err(err) => Err(system("lấy dữ liệu nén ra khỏi MFT", err)),
+        }
+    }
+
+    /// Một lần gọi `ProcessOutput`, giữ nguyên mã lỗi để bên trên phân loại.
+    fn try_process_output(&self) -> std::result::Result<Option<IMFSample>, windows::core::Error> {
+        let info = unsafe { self.transform.GetOutputStreamInfo(0) }?;
 
         // MFT phần cứng thường tự cấp sample; loại tự cấp thì ta phải đưa
         // sample rỗng vào cho nó ghi.
@@ -461,12 +494,9 @@ impl Pipeline {
         let supplied = if provides {
             None
         } else {
-            let buffer = unsafe { MFCreateMemoryBuffer(info.cbSize.max(1)) }
-                .map_err(|err| system("cấp buffer cho dữ liệu nén", err))?;
-            let sample = unsafe { MFCreateSample() }
-                .map_err(|err| system("cấp sample cho dữ liệu nén", err))?;
-            unsafe { sample.AddBuffer(&buffer) }
-                .map_err(|err| system("gắn buffer vào sample ra", err))?;
+            let buffer = unsafe { MFCreateMemoryBuffer(info.cbSize.max(1)) }?;
+            let sample = unsafe { MFCreateSample() }?;
+            unsafe { sample.AddBuffer(&buffer) }?;
             Some(sample)
         };
 
@@ -477,8 +507,7 @@ impl Pipeline {
             pEvents: ManuallyDrop::new(None),
         }];
         let mut status = 0u32;
-        let outcome =
-            unsafe { self.transform.ProcessOutput(0, &mut buffers, &mut status) };
+        let outcome = unsafe { self.transform.ProcessOutput(0, &mut buffers, &mut status) };
 
         // Lấy quyền sở hữu ra khỏi `ManuallyDrop` dù thành công hay không —
         // để nguyên là rò một sample mỗi frame.
@@ -486,8 +515,31 @@ impl Pipeline {
         let sample = unsafe { ManuallyDrop::take(&mut buffer.pSample) };
         drop(unsafe { ManuallyDrop::take(&mut buffer.pEvents) });
 
-        outcome.map_err(|err| system("lấy dữ liệu nén ra khỏi MFT", err))?;
+        outcome?;
         Ok(sample)
+    }
+
+    /// Thoả thuận lại kiểu đầu ra sau `STREAM_CHANGE`.
+    ///
+    /// Ưu tiên kiểu do chính MFT đưa ra (đúng thứ nó vừa đổi sang), rồi mới
+    /// tới kiểu ta tự mô tả. Sau đó phải đọc lại SPS/PPS: bộ cũ tả một kiểu
+    /// không còn đúng nữa, chèn vào keyframe là viewer giải mã ra rác.
+    fn renegotiate_output(&mut self) -> Result<()> {
+        let offered = unsafe { self.transform.GetOutputAvailableType(0, 0) }
+            .and_then(|media_type| unsafe { self.transform.SetOutputType(0, &media_type, 0) });
+        if let Err(err) = offered {
+            // Kiểu MFT tự đưa ra có thể thiếu mô tả (không phải MFT nào cũng
+            // điền đủ). Quay về mô tả của chính ta — vẫn đúng độ phân giải và
+            // codec, chỉ là không tận dụng thứ MFT vừa đổi sang.
+            tracing::debug!(%err, "không nhận được kiểu ra của MFT, dùng mô tả của mình");
+            set_output_type(&self.transform, &self.config)?;
+        }
+        self.parameter_sets = read_parameter_sets(&self.transform);
+        tracing::info!(
+            sets = self.parameter_sets.len(),
+            "MFT đổi kiểu đầu ra, đã thoả thuận lại"
+        );
+        Ok(())
     }
 
     /// Chèn parameter set vào đầu keyframe nếu bộ mã hoá không tự chèn.
@@ -495,7 +547,7 @@ impl Pipeline {
         if !keyframe || self.parameter_sets.is_empty() {
             return data;
         }
-        let classify: fn(&[u8]) -> NaluClass = match self.codec {
+        let classify: fn(&[u8]) -> NaluClass = match self.config.codec {
             Codec::H264 => classify_h264,
             Codec::Hevc => classify_hevc,
             // AV1 không dùng NAL Annex B; không có gì để dò và cũng không có gì
@@ -543,8 +595,18 @@ fn spawn_pump(shared: Arc<Shared>) -> Result<std::thread::JoinHandle<()>> {
             let generator = handoff.into_inner();
 
             while !shared.stopping.load(Ordering::Acquire) {
-                let event = match unsafe { generator.GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0)) } {
+                let event = match unsafe { generator.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
                     Ok(event) => event,
+                    // Chưa có sự kiện: ngủ một nhịp rồi hỏi lại.
+                    //
+                    // Bắt buộc hỏi kiểu không chờ. `GetEvent` chặn chỉ trả về
+                    // khi hàng đợi sự kiện đóng, mà MFT kẹt thì nó không bao
+                    // giờ đóng — trong khi `Drop` lại đang join luồng này. Một
+                    // lần kẹt là kẹt luôn cả đường dựng lại chuỗi chụp.
+                    Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                        std::thread::sleep(EVENT_POLL);
+                        continue;
+                    }
                     // Hàng đợi đóng là cách bình thường để vòng lặp này kết thúc.
                     Err(_) => break,
                 };
@@ -605,7 +667,12 @@ fn subtype(codec: Codec) -> Result<GUID> {
 fn configure_codec_api(api: &ICodecAPI, config: &EncoderConfig) {
     // Tắt mọi thứ khiến bộ mã hoá gom frame lại xử lý theo lô. Đây là thiết
     // lập quan trọng nhất của cả file: bật lên là mất vài chục ms độ trễ.
-    set_codec_value(api, &CODECAPI_AVLowLatencyMode, VARIANT::from(true), "chế độ độ trễ thấp");
+    set_codec_value(
+        api,
+        &CODECAPI_AVLowLatencyMode,
+        VARIANT::from(true),
+        "chế độ độ trễ thấp",
+    );
     set_codec_value(
         api,
         &CODECAPI_AVEncCommonRateControlMode,
@@ -642,8 +709,8 @@ fn set_codec_value(api: &ICodecAPI, key: &GUID, value: VARIANT, what: &str) {
 
 fn set_output_type(transform: &IMFTransform, config: &EncoderConfig) -> Result<()> {
     let subtype = subtype(config.codec)?;
-    let media_type = unsafe { MFCreateMediaType() }
-        .map_err(|err| system("tạo kiểu dữ liệu ra", err))?;
+    let media_type =
+        unsafe { MFCreateMediaType() }.map_err(|err| system("tạo kiểu dữ liệu ra", err))?;
     unsafe {
         media_type
             .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
@@ -676,9 +743,8 @@ fn set_output_type(transform: &IMFTransform, config: &EncoderConfig) -> Result<(
     if config.codec == Codec::H264 {
         // Profile High cho nén tốt hơn hẳn Baseline ở cùng bitrate và mọi phần
         // cứng còn dùng được đều hỗ trợ.
-        let _ = unsafe {
-            media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)
-        };
+        let _ =
+            unsafe { media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32) };
     }
 
     unsafe { transform.SetOutputType(0, &media_type, 0) }
@@ -686,8 +752,8 @@ fn set_output_type(transform: &IMFTransform, config: &EncoderConfig) -> Result<(
 }
 
 fn set_input_type(transform: &IMFTransform, config: &EncoderConfig) -> Result<()> {
-    let media_type = unsafe { MFCreateMediaType() }
-        .map_err(|err| system("tạo kiểu dữ liệu vào", err))?;
+    let media_type =
+        unsafe { MFCreateMediaType() }.map_err(|err| system("tạo kiểu dữ liệu vào", err))?;
     unsafe {
         media_type
             .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)

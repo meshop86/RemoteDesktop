@@ -17,7 +17,7 @@ use objc2_video_toolbox::{
     kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
     kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
     kVTEncodeFrameOptionKey_ForceKeyFrame, kVTProfileLevel_H264_High_AutoLevel,
-    kVTProfileLevel_HEVC_Main42210_AutoLevel, kVTProfileLevel_HEVC_Main_AutoLevel,
+    kVTProfileLevel_HEVC_Main_AutoLevel, kVTProfileLevel_HEVC_Main42210_AutoLevel,
     kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
 };
 
@@ -218,7 +218,10 @@ impl VtEncoder {
         }
 
         self.force_keyframe = false;
-        self.shared.counters.submitted.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .counters
+            .submitted
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -240,7 +243,10 @@ impl VtEncoder {
     /// Buộc bộ mã hoá phát hết frame còn trong hàng đợi. Chỉ dùng khi kết thúc
     /// phiên hoặc khi đo đạc — trong lúc chạy thật, gọi hàm này sẽ làm nghẽn.
     pub fn flush(&mut self) -> Result<()> {
-        let status = unsafe { self.session.complete_frames(objc2_core_media::kCMTimeInvalid) };
+        let status = unsafe {
+            self.session
+                .complete_frames(objc2_core_media::kCMTimeInvalid)
+        };
         if status == 0 {
             Ok(())
         } else {
@@ -521,7 +527,16 @@ unsafe fn push_parameter_sets(
         let mut ptr: *const u8 = null();
         let mut size = 0usize;
         let mut nal_length = 0 as c_int;
-        let status = unsafe { get(desc, index, &mut ptr, &mut size, null_mut(), &mut nal_length) };
+        let status = unsafe {
+            get(
+                desc,
+                index,
+                &mut ptr,
+                &mut size,
+                null_mut(),
+                &mut nal_length,
+            )
+        };
         if status != 0 || ptr.is_null() {
             return Err(CodecError::MissingParameterSets);
         }

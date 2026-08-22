@@ -21,10 +21,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
     MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-    MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+};
 
 use crate::keymap_windows::{PhysicalKey, physical_key};
 use crate::{HeldState, InputError, InputInjector, Result, ScreenGeometry, WheelAccumulator};
@@ -55,6 +58,24 @@ pub struct SendInputInjector {
     held: HeldState,
     /// Phần lẻ của cuộn chưa đủ một đơn vị bánh xe.
     wheel: WheelAccumulator,
+    /// Hình chữ nhật bao cả các màn hình (trái, trên, rộng, cao), tính bằng
+    /// pixel. `MOUSEEVENTF_VIRTUALDESK` trải 0..=65535 lên đúng khung này.
+    desktop: (f64, f64, f64, f64),
+}
+
+/// Khung bao tất cả màn hình. Đọc lại mỗi lần mở vì cắm thêm màn hình là nó đổi.
+fn virtual_desktop() -> (f64, f64, f64, f64) {
+    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) } as f64;
+    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) } as f64;
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) } as f64;
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) } as f64;
+    // Máy một màn hình cũng có thể trả 0 nếu API hỏng; lùi về màn hình chính.
+    if width <= 0.0 || height <= 0.0 {
+        let width = unsafe { GetSystemMetrics(SM_CXSCREEN) } as f64;
+        let height = unsafe { GetSystemMetrics(SM_CYSCREEN) } as f64;
+        return (0.0, 0.0, width.max(1.0), height.max(1.0));
+    }
+    (left, top, width, height)
 }
 
 impl SendInputInjector {
@@ -64,14 +85,20 @@ impl SendInputInjector {
     /// trỏ rơi đúng vào tâm pixel như bên macOS — và để cùng một chỗ lo việc ép
     /// toạ độ lố về trong màn hình.
     fn absolute(&self, x: f32, y: f32) -> (i32, i32) {
+        // `to_pixels` đã cộng gốc của màn hình đang chia sẻ, nên toạ độ ở đây
+        // là toạ độ chung của cả máy — đúng hệ mà VIRTUALDESK dùng.
         let (px, py) = self.geometry.to_pixels(x, y);
+        let (left, top, width, height) = self.desktop;
         // Trừ 1 vì `to_pixels` trả về chỉ số pixel cuối cùng, không phải bề
         // rộng. `max(1.0)` chặn chia cho 0 khi màn hình rộng đúng 1 pixel.
-        let span_x = (self.geometry.width as f64 - 1.0).max(1.0);
-        let span_y = (self.geometry.height as f64 - 1.0).max(1.0);
-        let dx = (px / span_x * ABSOLUTE_MAX).round() as i32;
-        let dy = (py / span_y * ABSOLUTE_MAX).round() as i32;
-        (dx, dy)
+        let span_x = (width - 1.0).max(1.0);
+        let span_y = (height - 1.0).max(1.0);
+        let dx = ((px - left) / span_x * ABSOLUTE_MAX).round() as i32;
+        let dy = ((py - top) / span_y * ABSOLUTE_MAX).round() as i32;
+        (
+            dx.clamp(0, ABSOLUTE_MAX as i32),
+            dy.clamp(0, ABSOLUTE_MAX as i32),
+        )
     }
 
     /// Cờ và `mouseData` cho một nút chuột.
@@ -192,6 +219,7 @@ impl InputInjector for SendInputInjector {
             geometry,
             held: HeldState::default(),
             wheel: WheelAccumulator::default(),
+            desktop: virtual_desktop(),
         })
     }
 
@@ -204,7 +232,7 @@ impl InputInjector for SendInputInjector {
             InputEvent::MouseMove { x, y, .. } => {
                 let (dx, dy) = self.absolute(*x, *y);
                 send(&[Self::mouse(
-                    MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                    MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                     dx,
                     dy,
                     0,
@@ -226,7 +254,7 @@ impl InputInjector for SendInputInjector {
                 // của người ngồi tại host có thể chen vào giữa và cú bấm rơi
                 // sang chỗ khác.
                 send(&[Self::mouse(
-                    flags | MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                    flags | MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                     dx,
                     dy,
                     data,
@@ -300,5 +328,5 @@ pub fn main_screen_geometry() -> Result<ScreenGeometry> {
             "không đọc được kích thước màn hình".into(),
         ));
     }
-    Ok(ScreenGeometry { width, height })
+    Ok(ScreenGeometry::new(width, height))
 }

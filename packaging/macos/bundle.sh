@@ -14,7 +14,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-version="${1:-0.1.0}"
+version="${1:-$(grep -m1 '^version' "$(dirname "$0")/../../Cargo.toml" | cut -d'"' -f2)}"
 shift || true
 targets=("$@")
 if [ ${#targets[@]} -eq 0 ]; then

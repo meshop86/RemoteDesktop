@@ -29,11 +29,14 @@ pub use endpoint::{
     ALPN, client_config, client_config_for, client_endpoint, server_config, server_config_for,
     server_endpoint, transport_config,
 };
-pub use file::{CHUNK, prepare_offer, read_transfer_id, recv_file, safe_file_name, send_file};
-pub use session::{
-    ControlReceiver, ControlSender, LinkStats, Session, VideoReceiver, VideoSender,
+pub use file::{
+    CHUNK, partial_path, prepare_offer, read_transfer_id, recv_file, safe_file_name, send_file,
 };
-pub use tls::{SelfSignedIdentity, fingerprint_short, generate_self_signed};
+pub use session::{ControlReceiver, ControlSender, LinkStats, Session, VideoReceiver, VideoSender};
+pub use tls::{
+    SelfSignedIdentity, fingerprint_hex, fingerprint_of, fingerprint_short, generate_self_signed,
+    load_or_create_identity, parse_fingerprint,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {

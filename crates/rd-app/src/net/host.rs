@@ -8,11 +8,14 @@
 //! người dùng mong đợi: đèn báo quay màn hình của hệ điều hành tắt đi đúng lúc
 //! phiên kết thúc, chứ không sáng suốt ngày vì chương trình đang mở.
 
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use rd_capture::ScreenCapturer as _;
 use rd_codec::EncodedFrame;
 use rd_input::{InputInjector as _, PlatformInjector, ScreenGeometry};
 use rd_protocol::control::{
@@ -23,9 +26,7 @@ use rd_session::IdSpace;
 use rd_session::rate::{LinkSample, RateController};
 use rd_signal::client::local_candidates;
 use rd_signal::{Call, PeerId, RelayLink, SignalClient};
-use rd_transport::{
-    Session, VideoSender, generate_self_signed, server_endpoint,
-};
+use rd_transport::{Session, VideoSender, load_or_create_identity, server_endpoint};
 use rd_viewer::pipeline::{EncodeSource, PipelineInfo};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
@@ -41,6 +42,9 @@ const SIGNAL_PING: Duration = Duration::from_secs(10);
 /// Chờ bao lâu trước khi thử nối lại rendezvous server sau khi đứt.
 const SIGNAL_RETRY: Duration = Duration::from_secs(3);
 
+/// Chờ bao lâu giữa hai lần thử mở cổng UDP.
+const BIND_RETRY: Duration = Duration::from_secs(3);
+
 /// Không lấy được frame nào lâu tới mức này thì coi như chuỗi chụp đã tắc.
 ///
 /// Màn hình đứng yên *không* rơi vào đây: chuỗi chụp vẫn nộp lại frame cũ theo
@@ -53,6 +57,30 @@ const RESTART_DELAY: Duration = Duration::from_secs(1);
 
 /// Dựng lại quá số lần này mà vẫn không có hình thì báo hẳn ra thay vì thử mãi.
 const MAX_RESTARTS: u32 = 5;
+
+/// Câu báo sai mật khẩu. Cả bên viewer cũng dò chuỗi này để biết có nên thử
+/// lại hay không, nên đổi chữ ở đây thì phải đổi cả `viewer::fatal`.
+const SAI_MAT_KHAU: &str = "sai mật khẩu phiên";
+
+/// Cho gõ sai bấy nhiêu lần rồi mới bắt chờ.
+///
+/// Mật khẩu mặc định chỉ có 6 chữ số, mà cổng của host thì ai dò ra cũng gọi
+/// vào được. Không có cái phanh này thì một máy dò tự động cứ thế thử hết một
+/// triệu khả năng — chỉ là chuyện thời gian.
+const AUTH_FREE_TRIES: u32 = 5;
+
+/// Mỗi lần sai thêm thì thời gian chờ nhân đôi, tối đa ngần này.
+const AUTH_LOCK_MAX: Duration = Duration::from_secs(300);
+
+/// Im lặng bấy lâu thì xoá tiền án: người dùng thật gõ nhầm vài lần rồi đi pha
+/// cà phê không đáng bị nhớ mãi.
+/// Số địa chỉ tối đa giữ trong bảng phạt trước khi dọn dòng hết hạn.
+const AUTH_GATE_MAX: usize = 4096;
+
+const AUTH_FORGET: Duration = Duration::from_secs(600);
+
+/// Chạy liên tục bấy lâu thì coi như chuỗi đã lành, xoá bộ đếm dựng lại.
+const HEALTHY_STREAK: Duration = Duration::from_secs(60);
 
 /// Hàng đợi frame đã mã hoá giữa luồng chụp và task gửi.
 ///
@@ -97,6 +125,10 @@ impl Wire for HostWire {
         HostEvent::FileReject { transfer_id }
     }
 
+    fn cancel(transfer_id: u64) -> HostEvent {
+        HostEvent::FileCancel { transfer_id }
+    }
+
     fn ack(ack: FileChunkAck) -> HostEvent {
         HostEvent::FileChunkAck(ack)
     }
@@ -110,6 +142,10 @@ impl Wire for HostWire {
     }
 
     fn quality(_request: QualityRequest) -> Option<HostEvent> {
+        None
+    }
+
+    fn select_monitor(_monitor: u8) -> Option<HostEvent> {
         None
     }
 
@@ -128,26 +164,75 @@ impl Wire for HostWire {
             ViewerCommand::FileOffer(offer) => Incoming::Offer(offer),
             ViewerCommand::FileAccept { transfer_id } => Incoming::Accept(transfer_id),
             ViewerCommand::FileReject { transfer_id } => Incoming::Reject(transfer_id),
+            ViewerCommand::FileCancel { transfer_id } => Incoming::Cancel(transfer_id),
             ViewerCommand::FileChunkAck(ack) => Incoming::Ack(ack),
             ViewerCommand::Input(event) => Incoming::Input(event),
             ViewerCommand::RequestKeyframe { .. } => Incoming::Keyframe,
             ViewerCommand::SetQuality(request) => Incoming::Quality(request),
+            ViewerCommand::SelectMonitor { monitor } => Incoming::Monitor(monitor),
             ViewerCommand::Ping { sent_us } => Incoming::Ping { sent_us },
             ViewerCommand::Disconnect => Incoming::Disconnect,
-            // Hello đã xử lý lúc bắt tay; Feedback và SelectMonitor chưa dùng.
-            ViewerCommand::Hello { .. }
-            | ViewerCommand::SelectMonitor { .. }
-            | ViewerCommand::Feedback { .. } => Incoming::Ignored,
+            // Hello đã xử lý lúc bắt tay; Feedback chưa dùng.
+            ViewerCommand::Hello { .. } | ViewerCommand::Feedback { .. } => Incoming::Ignored,
         }
     }
 }
 
+/// Chờ và phục vụ, mãi mãi.
+///
+/// Không có đường nào ra khỏi hàm này ngoài việc người dùng bấm dừng: host mà
+/// tự tắt vì một lỗi thoáng qua thì máy ở xa nằm im tới khi có người tới bấm.
+/// Vòng lặp ở đây dựng lại cả cổng UDP, nên nó qua được cả những lỗi mà một
+/// phiên riêng lẻ không cứu nổi.
 pub async fn run(
     ctx: Arc<Context>,
     mut commands: UnboundedReceiver<UiCommand>,
 ) -> anyhow::Result<()> {
-    let identity = generate_self_signed(SERVER_NAME).context("không tạo được chứng chỉ")?;
-    let endpoint = server_endpoint(ctx.config.bind, &identity).context("không mở được cổng UDP")?;
+    loop {
+        match listen(&ctx, &mut commands).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if ctx.stop.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                ctx.events
+                    .status(format!("phần chia sẻ dừng ({err}), mở lại sau vài giây"));
+                ctx.events.send(NetEvent::PeerLeft);
+                tokio::time::sleep(BIND_RETRY).await;
+            }
+        }
+    }
+}
+
+async fn listen(
+    ctx: &Arc<Context>,
+    commands: &mut UnboundedReceiver<UiCommand>,
+) -> anyhow::Result<()> {
+    let identity = host_identity().context("không tạo được chứng chỉ")?;
+    // Mở cổng có thể hỏng vì những lý do rồi sẽ tự hết: máy vừa khởi động lại
+    // sau khi mất điện nên card mạng chưa lên, hoặc bản cũ của chính phần mềm
+    // này còn giữ cổng thêm vài giây. Bỏ cuộc ngay thì máy ở xa nằm im chờ
+    // người tới bấm — đúng thứ chế độ chạy ngầm sinh ra để tránh.
+    let mut endpoint = None;
+    for lan in 0u32.. {
+        match server_endpoint(ctx.config.bind, &identity) {
+            Ok(open) => {
+                endpoint = Some(open);
+                break;
+            }
+            Err(err) => {
+                if ctx.stop.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                if lan == 0 || lan % 10 == 0 {
+                    ctx.events
+                        .status(format!("chưa mở được cổng, đang chờ: {err}"));
+                }
+                tokio::time::sleep(BIND_RETRY).await;
+            }
+        }
+    }
+    let endpoint = endpoint.context("không mở được cổng UDP")?;
     let local = endpoint.local_addr()?;
     ctx.events
         .status(format!("đang chờ ở {local} — vân tay {}", short(&identity)));
@@ -164,13 +249,14 @@ pub async fn run(
     // Cũng phải giữ tới hết vòng lặp: thả là task đăng ký bị huỷ và mã trên tay
     // người dùng thành vô nghĩa.
     let _signal = ctx.config.rendezvous.map(|server| {
-        let ctx = ctx.clone();
+        let ctx = Arc::clone(ctx);
         let endpoint = endpoint.clone();
         AbortOnDrop(tokio::spawn(async move {
             signal_loop(ctx, endpoint, server, call_tx).await;
         }))
     });
 
+    let mut gate = AuthGate::default();
     loop {
         let (session, relayed, _keep) = tokio::select! {
             incoming = endpoint.accept() => {
@@ -178,7 +264,14 @@ pub async fn run(
                 match incoming.await {
                     Ok(conn) => (Session::new(conn), false, None),
                     Err(err) => {
-                        tracing::warn!(%err, "kết nối vào hỏng lúc bắt tay");
+                        // Nhãn giao thức không khớp là phép dò của máy khác
+                        // đang hỏi "ở đây có phần mềm này không" — chuyện bình
+                        // thường, không phải sự cố đáng cảnh báo.
+                        if la_phep_do(&err) {
+                            tracing::debug!(%err, "có máy dò xem cổng này có ai nghe");
+                        } else {
+                            tracing::warn!(%err, "kết nối vào hỏng lúc bắt tay");
+                        }
                         continue;
                     }
                 }
@@ -189,7 +282,7 @@ pub async fn run(
                     std::future::pending::<()>().await;
                     unreachable!()
                 };
-                match answer(&ctx, &endpoint, &identity, call).await {
+                match answer(ctx, &endpoint, &identity, call).await {
                     Ok(result) => result,
                     Err(err) => {
                         ctx.events.status(format!("không nối được với viewer: {err}"));
@@ -200,19 +293,125 @@ pub async fn run(
         };
 
         let peer = session.remote_address();
+        // Đang trong thời gian phạt thì đóng ngay tại cửa, chưa đọc lấy một
+        // thông điệp nào: mỗi lần thử của máy dò phải tốn của nó cả một lần
+        // bắt tay QUIC mà không đổi lấy được thông tin gì.
+        let cho = gate.con_phai_cho(peer.ip(), Instant::now());
+        if !cho.is_zero() {
+            tracing::warn!(%peer, ?cho, "chặn tạm vì gõ sai mật khẩu nhiều lần");
+            session.close(&format!("sai mật khẩu nhiều lần, thử lại sau {cho:?}"));
+            continue;
+        }
         ctx.events.status(format!(
             "viewer {peer} đã nối{}",
             if relayed { " (qua relay)" } else { "" }
         ));
 
-        match serve(&ctx, session, &mut commands, relayed).await {
-            Ok(()) => ctx.events.status("viewer đã ngắt, quay lại chờ"),
-            Err(err) => ctx.events.status(format!("phiên kết thúc: {err}")),
+        // Trong lúc phục vụ, vòng này không gọi `accept()` nữa. Ai gõ cửa lúc
+        // đó sẽ treo tới khi hết hạn bắt tay rồi mới biết là hỏng — mười mấy
+        // giây nhìn vào màn hình trắng. Cử một task ra mở cửa nói "đang bận"
+        // cho gọn; nó chết theo `serve` nhờ `AbortOnDrop`.
+        let _ban = AbortOnDrop(tokio::spawn(tu_choi_vi_ban(endpoint.clone())));
+
+        match serve(ctx, session, commands, relayed).await {
+            Ok(()) => {
+                gate.ghi_dung(peer.ip());
+                ctx.events.status("viewer đã ngắt, quay lại chờ");
+            }
+            Err(err) => {
+                if format!("{err:#}").contains(SAI_MAT_KHAU) {
+                    gate.ghi_sai(peer.ip(), Instant::now());
+                } else {
+                    // Phiên chạy được rồi mới đứt: mật khẩu đã đúng.
+                    gate.ghi_dung(peer.ip());
+                }
+                ctx.events.status(format!("phiên kết thúc: {err}"));
+            }
         }
         ctx.events.send(NetEvent::PeerLeft);
         if ctx.stop.load(Ordering::Relaxed) {
             return Ok(());
         }
+    }
+}
+
+/// Kết nối hỏng vì bên kia không nói cùng nhãn giao thức.
+///
+/// Đúng dấu vết mà phép dò trong [`crate::probe`] để lại: TLS đi tới bước chọn
+/// nhãn rồi dừng, cảnh báo 120 `no_application_protocol`.
+fn la_phep_do(err: &rd_transport::quinn::ConnectionError) -> bool {
+    use rd_transport::quinn::ConnectionError;
+    // Bên nào phát hiện ra trước thì lỗi mang hình dạng khác: phía chủ động
+    // đóng thấy `TransportError` của chính mình, phía kia thấy khung đóng gửi
+    // sang. Mã thì vẫn là CRYPTO_ERROR mang theo cảnh báo TLS 120.
+    let ma = match err {
+        ConnectionError::ConnectionClosed(frame) => u64::from(frame.error_code),
+        ConnectionError::TransportError(err) => u64::from(err.code),
+        _ => return false,
+    };
+    ma == CRYPTO_ERROR_BASE + 120
+}
+
+/// QUIC gói cảnh báo TLS vào dải mã lỗi bắt đầu từ đây (RFC 9001, mục 4.8).
+const CRYPTO_ERROR_BASE: u64 = 0x100;
+
+/// Trả lời những viewer gõ cửa trong lúc host đang phục vụ người khác.
+///
+/// Chỉ có một màn hình để chia sẻ nên host phục vụ mỗi lần một viewer; việc ở
+/// đây chỉ là nói ra điều đó thay vì im lặng.
+async fn tu_choi_vi_ban(endpoint: rd_transport::quinn::Endpoint) {
+    while let Some(incoming) = endpoint.accept().await {
+        let Ok(conn) = incoming.await else { continue };
+        tracing::info!(peer = %conn.remote_address(), "từ chối: đang phục vụ viewer khác");
+        Session::new(conn).close("máy này đang chia sẻ cho một viewer khác");
+    }
+}
+
+/// Bộ đếm lần gõ sai mật khẩu, tính riêng theo từng địa chỉ IP.
+///
+/// Tính theo IP chứ không tính chung: một kẻ dò mật khẩu không được phép khoá
+/// cửa của mọi người còn lại.
+#[derive(Default)]
+struct AuthGate {
+    fails: HashMap<IpAddr, (u32, Instant)>,
+}
+
+impl AuthGate {
+    /// Còn phải chờ bao lâu nữa mới được thử tiếp.
+    fn con_phai_cho(&mut self, ip: IpAddr, now: Instant) -> Duration {
+        let Some((count, last)) = self.fails.get(&ip).copied() else {
+            return Duration::ZERO;
+        };
+        if now.duration_since(last) >= AUTH_FORGET {
+            self.fails.remove(&ip);
+            return Duration::ZERO;
+        }
+        let Some(qua_han) = count.checked_sub(AUTH_FREE_TRIES) else {
+            return Duration::ZERO;
+        };
+        let cho = Duration::from_secs(2u64.saturating_pow(qua_han.min(10))).min(AUTH_LOCK_MAX);
+        cho.saturating_sub(now.duration_since(last))
+    }
+
+    fn ghi_sai(&mut self, ip: IpAddr, now: Instant) {
+        // Một dải IPv6 cấp cho người dùng thường có hàng tỉ địa chỉ, đổi địa
+        // chỉ mỗi lần thử là bảng này phình mãi. Dọn những dòng đã hết hạn
+        // trước khi thêm dòng mới thì bảng chỉ lớn bằng số máy đang thực sự dò.
+        if self.fails.len() >= AUTH_GATE_MAX {
+            self.fails
+                .retain(|_, (_, last)| now.duration_since(*last) < AUTH_FORGET);
+        }
+        let entry = self.fails.entry(ip).or_insert((0, now));
+        // Sai sau một quãng dài im lặng thì đếm lại từ đầu.
+        if now.duration_since(entry.1) >= AUTH_FORGET {
+            *entry = (0, now);
+        }
+        entry.0 += 1;
+        entry.1 = now;
+    }
+
+    fn ghi_dung(&mut self, ip: IpAddr) {
+        self.fails.remove(&ip);
     }
 }
 
@@ -321,7 +520,7 @@ async fn serve(
     let hello = tokio::time::timeout(HANDSHAKE_TIMEOUT, rx.recv())
         .await
         .map_err(|_| anyhow::anyhow!("viewer không chào trong {HANDSHAKE_TIMEOUT:?}"))??;
-    let hello = match check_hello(ctx, hello) {
+    let hello = match check_hello(ctx, &session, hello).await {
         Ok(hello) => hello,
         Err(err) => {
             // Nói rõ lý do rồi mới đóng: viewer gõ sai mật khẩu phải thấy được
@@ -338,11 +537,24 @@ async fn serve(
         }
     };
 
+    // Danh sách màn hình chốt một lần cho cả phiên: `id` trên dây là *chỉ số*
+    // trong danh sách này (0, 1, 2...) chứ không phải id của hệ điều hành —
+    // CGDirectDisplayID trên macOS là số lớn, không nhét vừa `u8`.
+    let displays = list_displays();
+    let active = displays
+        .iter()
+        .position(|d| d.is_primary)
+        .unwrap_or(0)
+        .min(displays.len().saturating_sub(1)) as u32;
+    let monitor = Arc::new(AtomicU32::new(active));
+
     let keyframe = Arc::new(AtomicBool::new(true));
     // Hai con số khác nhau: `ceiling` là mức người dùng đặt (viewer gửi sang),
     // `bitrate` là mức bộ dò thật sự chốt và luồng mã hoá đọc.
     let ceiling = Arc::new(AtomicU32::new(0));
     let bitrate = Arc::new(AtomicU32::new(0));
+    // Trần do đường đi áp xuống; 0 là đang nối thẳng, không kẹp gì.
+    let derp = Arc::new(AtomicU32::new(0));
     let rate = RateController::new(ctx.config.bitrate_kbps);
     // Chỉ dùng 4:2:2 10-bit khi *cả hai* đầu làm được: bên này mã hoá được và
     // bên kia dựng hình được.
@@ -352,24 +564,20 @@ async fn serve(
         rate.current(),
         allow_10bit,
         hello.codecs,
-        keyframe.clone(),
-        bitrate.clone(),
+        EncoderControls {
+            keyframe: keyframe.clone(),
+            bitrate: bitrate.clone(),
+            displays: displays.clone(),
+            monitor: monitor.clone(),
+        },
     )
     .await?;
 
     tx.send(&HostEvent::Welcome {
         version: rd_protocol::PROTOCOL_VERSION,
         host_name: ctx.config.name.clone(),
-        monitors: vec![MonitorInfo {
-            id: 0,
-            name: info.source.clone(),
-            width: info.width,
-            height: info.height,
-            scale: 1.0,
-            refresh_hz: info.target_fps,
-            is_primary: true,
-        }],
-        active_monitor: 0,
+        monitors: monitor_list(&displays, &info, active),
+        active_monitor: active as u8,
     })
     .await?;
     tx.send(&HostEvent::QualityChanged(QualityRequest {
@@ -386,9 +594,23 @@ async fn serve(
         name: hello.viewer_name,
         relayed,
     });
+    // Giữ tới hết phiên: thả sớm là task bị huỷ trước khi kịp báo.
+    let _duong = super::bao_duong_di(
+        ctx.events.clone(),
+        session.remote_address().ip(),
+        Some(derp.clone()),
+    );
+    // Có người xem rồi thì clipboard mới được phép chảy sang.
+    let _clipboard = ctx.config.clipboard.session_guard();
     ctx.events.send(NetEvent::Info(Box::new(info.clone())));
 
-    let input = spawn_injector(ctx, info.width, info.height);
+    let input = spawn_injector(
+        ctx,
+        info.width,
+        info.height,
+        displays.clone(),
+        monitor.clone(),
+    );
 
     let video = AbortOnDrop(tokio::spawn({
         let session = session.clone();
@@ -420,6 +642,7 @@ async fn serve(
         session.clone(),
         rate,
         ceiling.clone(),
+        derp.clone(),
         bitrate,
     )));
 
@@ -427,6 +650,7 @@ async fn serve(
         input: Some(input),
         keyframe: Some(keyframe),
         bitrate: Some(ceiling),
+        monitor: Some(monitor),
         clock: None,
     };
 
@@ -445,7 +669,11 @@ struct Hello {
 }
 
 /// Kiểm tra lời chào, trả về phần dùng được nếu hợp lệ.
-fn check_hello(ctx: &Arc<Context>, hello: ViewerCommand) -> anyhow::Result<Hello> {
+async fn check_hello(
+    ctx: &Arc<Context>,
+    session: &Session,
+    hello: ViewerCommand,
+) -> anyhow::Result<Hello> {
     let ViewerCommand::Hello {
         version,
         viewer_name,
@@ -462,17 +690,72 @@ fn check_hello(ctx: &Arc<Context>, hello: ViewerCommand) -> anyhow::Result<Hello
             rd_protocol::PROTOCOL_VERSION
         );
     }
-    // So sánh thường, không phải so sánh thời gian hằng định: đây là hash của
-    // một mật khẩu ngẫu nhiên đổi mỗi phiên, không phải khoá dài hạn, và kênh
-    // đã có TLS nên không đo được thời gian từ ngoài.
-    if auth != ctx.auth() {
-        anyhow::bail!("sai mật khẩu phiên");
-    }
+    // So sánh thường, không phải so sánh thời gian hằng định: con số này chỉ
+    // dùng được cho đúng kết nối đang mở (xem `Context::auth`), nên đo được
+    // thời gian cũng không suy ra được gì mang đi chỗ khác.
+    let dung_mat_khau = auth == ctx.auth(session)?;
+    let viewer_name = if dung_mat_khau {
+        viewer_name
+    } else {
+        match tailnet_cua_minh(ctx, session.remote_address().ip()).await {
+            Some(who) => {
+                ctx.events.status(format!(
+                    "tin máy {} ({}) vì cùng tài khoản Tailscale",
+                    who.machine, who.login
+                ));
+                format!("{} · tailnet", who.machine)
+            }
+            None => anyhow::bail!("{SAI_MAT_KHAU}"),
+        }
+    };
     Ok(Hello {
         viewer_name,
         wants_10bit,
         codecs,
     })
+}
+
+/// Máy đang gọi tới có phải máy của chính mình trong tailnet không.
+///
+/// Chỉ hỏi khi người dùng đã bật, và chỉ với địa chỉ nằm trong dải Tailscale —
+/// mọi kết nối khác đi thẳng về đường mật khẩu. Kẻ ở ngoài không giả được địa
+/// chỉ này: giả rồi thì gói trả lời chạy vào tailnet chứ không về chỗ hắn, mà
+/// QUIC không bắt tay xong thì chưa có lời chào nào để xét tới đây.
+async fn tailnet_cua_minh(
+    ctx: &Arc<Context>,
+    ip: std::net::IpAddr,
+) -> Option<crate::tailscale::Who> {
+    if !ctx.config.trust_tailnet || !crate::tailscale::is_tailnet_ip(ip) {
+        return None;
+    }
+    // `tailscale whois` là tiến trình con, chặn cỡ trăm mili giây.
+    match tokio::task::spawn_blocking(move || crate::tailscale::same_account(ip)).await {
+        Ok(Ok(who)) => Some(who),
+        Ok(Err(err)) => {
+            // Hiện lên giao diện chứ không chỉ ghi log: đây đúng là lúc người
+            // dùng đứng hỏi "bật tin tailnet rồi mà sao vẫn đòi mật khẩu".
+            ctx.events
+                .status(format!("không cho vào thẳng: {err} — quay về hỏi mật khẩu"));
+            None
+        }
+        Err(err) => {
+            tracing::warn!(%err, "luồng hỏi tailscale hỏng");
+            None
+        }
+    }
+}
+
+/// Những ô mà luồng mã hoá đọc chung với luồng điều khiển.
+struct EncoderControls {
+    /// Viewer xin keyframe.
+    keyframe: Arc<AtomicBool>,
+    /// Bitrate mới, 0 nghĩa là không đổi.
+    bitrate: Arc<AtomicU32>,
+    /// Danh sách màn hình lúc bắt tay; chỉ số trong danh sách này chính là `id`
+    /// mà viewer gửi lên.
+    displays: Vec<rd_capture::DisplayInfo>,
+    /// Chỉ số màn hình viewer đang muốn xem.
+    monitor: Arc<AtomicU32>,
 }
 
 /// Khởi động chụp + mã hoá trên luồng riêng.
@@ -485,9 +768,14 @@ async fn start_encoder(
     start_kbps: u32,
     allow_10bit: bool,
     viewer_codecs: Vec<rd_protocol::control::Codec>,
-    keyframe: Arc<AtomicBool>,
-    bitrate: Arc<AtomicU32>,
+    controls: EncoderControls,
 ) -> anyhow::Result<(PipelineInfo, tokio::sync::mpsc::Receiver<EncodedFrame>)> {
+    let EncoderControls {
+        keyframe,
+        bitrate,
+        displays,
+        monitor,
+    } = controls;
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<anyhow::Result<PipelineInfo>>();
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<EncodedFrame>(ENCODED_QUEUE);
     let target_fps = ctx.config.target_fps;
@@ -495,11 +783,22 @@ async fn start_encoder(
     // đường truyền chịu được, chứ không quay về mức khởi điểm.
     let mut bitrate_kbps = start_kbps;
     let events = ctx.events.clone();
+    // Chỉ số → id mà tầng capture hiểu. Danh sách rỗng (không hỏi được màn
+    // hình) thì cứ để capture tự chọn màn hình mặc định.
+    let display_count = displays.len().max(1) as u32;
+    let display_id = move |index: u32| {
+        displays
+            .get(index as usize)
+            .map(|d: &rd_capture::DisplayInfo| d.id)
+            .unwrap_or(0)
+    };
+    let mut current = monitor.load(Ordering::Relaxed);
 
     std::thread::Builder::new()
         .name("rd-encode".into())
         .spawn(move || {
             let mut source = match EncodeSource::start(
+                display_id(current),
                 target_fps,
                 bitrate_kbps,
                 allow_10bit,
@@ -517,6 +816,7 @@ async fn start_encoder(
 
             let mut errors = 0u32;
             let mut restarts = 0u32;
+            let mut last_restart = std::time::Instant::now();
             let mut first_frame = true;
             let mut last_frame = std::time::Instant::now();
             loop {
@@ -531,11 +831,73 @@ async fn start_encoder(
                     }
                 }
 
+                // Đổi màn hình cũng là dựng lại cả chuỗi, chỉ khác lý do:
+                // phân giải mới, bộ mã hoá mới, nên không có đường nào nhẹ hơn.
+                let want = monitor.load(Ordering::Relaxed);
+                if want != current && want < display_count {
+                    let truoc = current;
+                    current = want;
+                    events.status(format!("đang chuyển sang màn hình {}", want + 1));
+                    source.stop();
+                    drop(source);
+                    match EncodeSource::start(
+                        display_id(current),
+                        target_fps,
+                        bitrate_kbps,
+                        allow_10bit,
+                        &viewer_codecs,
+                    ) {
+                        Ok(fresh) => {
+                            source = fresh;
+                            errors = 0;
+                            first_frame = true;
+                            last_frame = std::time::Instant::now();
+                            source.request_keyframe();
+                            continue;
+                        }
+                        Err(err) => {
+                            // Màn hình mới mở không được thì quay về màn hình cũ:
+                            // thà xem nhầm màn hình còn hơn mất luôn hình.
+                            events.status(format!("không mở được màn hình đó: {err}"));
+                            current = truoc;
+                            monitor.store(truoc, Ordering::Relaxed);
+                            match EncodeSource::start(
+                                display_id(current),
+                                target_fps,
+                                bitrate_kbps,
+                                allow_10bit,
+                                &viewer_codecs,
+                            ) {
+                                Ok(fresh) => {
+                                    source = fresh;
+                                    first_frame = true;
+                                    last_frame = std::time::Instant::now();
+                                    source.request_keyframe();
+                                    continue;
+                                }
+                                Err(err) => {
+                                    events.status(format!("mất luôn màn hình cũ: {err}"));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                } else if want != current {
+                    // Viewer xin màn hình không tồn tại (vừa rút cáp chẳng hạn).
+                    monitor.store(current, Ordering::Relaxed);
+                }
+
                 // Lý do phải dựng lại cả chuỗi, nếu có.
                 let broken = match source.next_encoded(Duration::from_millis(500)) {
                     Ok(Some(frame)) => {
                         errors = 0;
                         last_frame = std::time::Instant::now();
+                        // Chạy êm đủ lâu thì xoá tiền án: hạn 5 lần dựng lại là
+                        // để chặn vòng lặp hỏng-dựng-hỏng trong vài giây, chứ
+                        // một phiên cả ngày thì 5 lần rải rác là bình thường.
+                        if restarts > 0 && last_restart.elapsed() >= HEALTHY_STREAK {
+                            restarts = 0;
+                        }
                         if first_frame {
                             first_frame = false;
                             let info = source.info();
@@ -579,21 +941,34 @@ async fn start_encoder(
                     break;
                 }
                 events.status(format!("mất hình ({reason}), đang dựng lại…"));
+                // Thả hẳn chuỗi cũ *trước khi* dựng chuỗi mới. Gán đè
+                // `source = fresh` là thả sau, và như thế thì hai bản sao màn
+                // hình cùng tồn tại một lúc — DXGI chỉ cho một bản mỗi tiến
+                // trình nên bản mới hỏng ngay từ đầu.
                 source.stop();
+                drop(source);
                 std::thread::sleep(RESTART_DELAY);
-                match EncodeSource::start(target_fps, bitrate_kbps, allow_10bit, &viewer_codecs) {
+                match EncodeSource::start(
+                    display_id(current),
+                    target_fps,
+                    bitrate_kbps,
+                    allow_10bit,
+                    &viewer_codecs,
+                ) {
                     Ok(fresh) => {
                         source = fresh;
                         errors = 0;
                         first_frame = true;
                         last_frame = std::time::Instant::now();
+                        last_restart = std::time::Instant::now();
                         // Người xem đang giữ một tấm hình chết; chuỗi mới phải
                         // mở đầu bằng keyframe thì hình mới sống lại được.
                         source.request_keyframe();
                     }
                     Err(err) => {
                         events.status(format!("không dựng lại được chuỗi chụp: {err}"));
-                        break;
+                        // Chuỗi cũ đã thả ở trên rồi, không còn gì để dọn.
+                        return;
                     }
                 }
             }
@@ -601,7 +976,9 @@ async fn start_encoder(
         })
         .context("không tạo được luồng mã hoá")?;
 
-    let info = ready_rx.await.context("luồng mã hoá chết khi khởi động")??;
+    let info = ready_rx
+        .await
+        .context("luồng mã hoá chết khi khởi động")??;
     tracing::info!(?info, "chuỗi chụp + mã hoá đã chạy");
     Ok((info, frame_rx))
 }
@@ -618,6 +995,7 @@ async fn rate_loop(
     session: Session,
     mut rate: RateController,
     ceiling: Arc<AtomicU32>,
+    derp: Arc<AtomicU32>,
     bitrate: Arc<AtomicU32>,
 ) {
     let mut ticker = tokio::time::interval(RATE_INTERVAL);
@@ -628,7 +1006,15 @@ async fn rate_loop(
         ticker.tick().await;
 
         let requested = ceiling.swap(0, Ordering::Relaxed);
-        let forced = (requested > 0).then(|| rate.set_ceiling(requested)).flatten();
+        let forced = (requested > 0)
+            .then(|| rate.set_ceiling(requested))
+            .flatten();
+        // Đọc chứ không lấy đi: trần của đường vòng còn hiệu lực tới khi task
+        // dò đường báo ngược lại, không phải chỉ một nhịp.
+        let kbps = derp.load(Ordering::Relaxed);
+        let forced = rate
+            .set_relay_ceiling((kbps > 0).then_some(kbps))
+            .or(forced);
 
         let stats = session.link_stats();
         let probed = rate.update(LinkSample {
@@ -659,6 +1045,8 @@ fn spawn_injector(
     ctx: &Arc<Context>,
     width: u32,
     height: u32,
+    displays: Vec<rd_capture::DisplayInfo>,
+    monitor: Arc<AtomicU32>,
 ) -> std::sync::mpsc::Sender<InputEvent> {
     let (tx, rx) = std::sync::mpsc::channel::<InputEvent>();
     let events = ctx.events.clone();
@@ -666,19 +1054,18 @@ fn spawn_injector(
     std::thread::Builder::new()
         .name("rd-inject".into())
         .spawn(move || {
+            let mut current = monitor.load(Ordering::Relaxed);
             // Kích thước thật của màn hình host, không phải kích thước frame:
             // trên màn Retina hai số này lệch nhau đúng hệ số scale, và lấy
             // nhầm thì chuột chỉ chạy trong một phần tư màn hình.
-            let geometry = match host_geometry() {
+            let fallback = || match host_geometry() {
                 Ok(geometry) => geometry,
                 Err(err) => {
                     tracing::warn!(%err, "không đọc được kích thước màn hình, dùng cỡ frame");
-                    ScreenGeometry {
-                        width: width as f32,
-                        height: height as f32,
-                    }
+                    ScreenGeometry::new(width as f32, height as f32)
                 }
             };
+            let geometry = geometry_of(&displays, current).unwrap_or_else(fallback);
             let mut injector = match PlatformInjector::open(geometry) {
                 Ok(injector) => injector,
                 Err(err) => {
@@ -689,6 +1076,15 @@ fn spawn_injector(
 
             let mut errors = 0u32;
             while let Ok(event) = rx.recv() {
+                // Đổi màn hình thì gốc toạ độ đổi theo, nếu không thì chuột vẫn
+                // rơi vào màn hình cũ trong khi hình đã là màn hình khác.
+                let want = monitor.load(Ordering::Relaxed);
+                if want != current {
+                    current = want;
+                    if let Some(geometry) = geometry_of(&displays, current) {
+                        injector.set_geometry(geometry);
+                    }
+                }
                 if let Err(err) = injector.inject(&event) {
                     errors += 1;
                     if errors <= 3 {
@@ -707,6 +1103,77 @@ fn spawn_injector(
     tx
 }
 
+/// Danh sách màn hình của máy này, hoặc một mục giả nếu không hỏi được.
+///
+/// Không hỏi được thì vẫn phải có đúng một mục: cả luồng mã hoá lẫn giao diện
+/// bên kia đều đánh số theo danh sách này, danh sách rỗng là chia cho không.
+fn list_displays() -> Vec<rd_capture::DisplayInfo> {
+    match rd_capture::PlatformCapturer::list_displays() {
+        Ok(list) if !list.is_empty() => list,
+        Ok(_) => Vec::new(),
+        Err(err) => {
+            tracing::warn!(%err, "không liệt kê được màn hình");
+            Vec::new()
+        }
+    }
+}
+
+/// Danh sách gửi cho viewer. `id` là chỉ số trong `displays`.
+fn monitor_list(
+    displays: &[rd_capture::DisplayInfo],
+    info: &PipelineInfo,
+    active: u32,
+) -> Vec<MonitorInfo> {
+    if displays.is_empty() {
+        return vec![MonitorInfo {
+            id: 0,
+            name: info.source.clone(),
+            width: info.width,
+            height: info.height,
+            scale: 1.0,
+            refresh_hz: info.target_fps,
+            is_primary: true,
+        }];
+    }
+    displays
+        .iter()
+        .enumerate()
+        .map(|(index, display)| MonitorInfo {
+            id: index as u8,
+            // Màn hình đang chụp thì lấy kích thước thật của khung hình: kích
+            // thước hệ điều hành khai có thể lệch vì DPI scaling.
+            width: if index as u32 == active {
+                info.width
+            } else {
+                display.width
+            },
+            height: if index as u32 == active {
+                info.height
+            } else {
+                display.height
+            },
+            name: display.name.clone(),
+            scale: display.scale,
+            refresh_hz: display.refresh_hz,
+            is_primary: display.is_primary,
+        })
+        .collect()
+}
+
+/// Kích thước và vị trí của màn hình thứ `index`, để bơm chuột cho đúng chỗ.
+fn geometry_of(displays: &[rd_capture::DisplayInfo], index: u32) -> Option<ScreenGeometry> {
+    let display = displays.get(index as usize)?;
+    if display.logical_width == 0 || display.logical_height == 0 {
+        return None;
+    }
+    Some(ScreenGeometry {
+        width: display.logical_width as f32,
+        height: display.logical_height as f32,
+        origin_x: display.origin_x as f32,
+        origin_y: display.origin_y as f32,
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn host_geometry() -> rd_input::Result<ScreenGeometry> {
     rd_input::macos::main_screen_geometry()
@@ -717,6 +1184,16 @@ fn host_geometry() -> rd_input::Result<ScreenGeometry> {
     rd_input::windows::main_screen_geometry()
 }
 
+/// Giữ nguyên chứng chỉ qua các lần chạy để vân tay máy chủ là thứ người dùng
+/// đối chiếu được. Sinh mới mỗi lần khởi động thì vân tay đổi liên tục, ai muốn
+/// kiểm tra cũng chịu, mà ghim vân tay ở phía người xem cũng thành vô nghĩa.
+fn host_identity() -> Result<rd_transport::SelfSignedIdentity, rd_transport::TransportError> {
+    match crate::app::app_dir() {
+        Some(dir) => load_or_create_identity(&dir.join("host-identity.bin"), SERVER_NAME),
+        None => rd_transport::generate_self_signed(SERVER_NAME),
+    }
+}
+
 fn short(identity: &rd_transport::SelfSignedIdentity) -> String {
     rd_transport::fingerprint_short(&identity.fingerprint)
 }
@@ -725,4 +1202,71 @@ fn short(identity: &rd_transport::SelfSignedIdentity) -> String {
 pub fn pretty(id: PeerId) -> String {
     let raw = id.get().to_string();
     format!("{} {} {}", &raw[0..3], &raw[3..6], &raw[6..9])
+}
+
+#[cfg(test)]
+mod auth_gate_tests {
+    use super::*;
+
+    fn ip(n: u8) -> IpAddr {
+        IpAddr::from([10, 0, 0, n])
+    }
+
+    #[test]
+    fn vai_lan_dau_khong_bi_phat() {
+        let mut gate = AuthGate::default();
+        let now = Instant::now();
+        for _ in 0..AUTH_FREE_TRIES {
+            assert!(gate.con_phai_cho(ip(1), now).is_zero());
+            gate.ghi_sai(ip(1), now);
+        }
+        assert!(!gate.con_phai_cho(ip(1), now).is_zero());
+    }
+
+    #[test]
+    fn cho_dai_dan_nhung_co_tran() {
+        let mut gate = AuthGate::default();
+        let now = Instant::now();
+        for _ in 0..40 {
+            gate.ghi_sai(ip(1), now);
+        }
+        assert_eq!(gate.con_phai_cho(ip(1), now), AUTH_LOCK_MAX);
+    }
+
+    #[test]
+    fn phat_rieng_tung_dia_chi_va_xoa_khi_dung() {
+        let mut gate = AuthGate::default();
+        let now = Instant::now();
+        for _ in 0..AUTH_FREE_TRIES + 3 {
+            gate.ghi_sai(ip(1), now);
+        }
+        assert!(!gate.con_phai_cho(ip(1), now).is_zero());
+        assert!(gate.con_phai_cho(ip(2), now).is_zero());
+        gate.ghi_dung(ip(1));
+        assert!(gate.con_phai_cho(ip(1), now).is_zero());
+    }
+
+    #[test]
+    fn quen_sau_mot_quang_im_lang() {
+        let mut gate = AuthGate::default();
+        let now = Instant::now();
+        for _ in 0..AUTH_FREE_TRIES + 3 {
+            gate.ghi_sai(ip(1), now);
+        }
+        let sau = now + AUTH_FORGET + Duration::from_secs(1);
+        assert!(gate.con_phai_cho(ip(1), sau).is_zero());
+        assert!(gate.fails.is_empty());
+    }
+
+    #[test]
+    fn bang_phat_khong_phinh_vo_han() {
+        let mut gate = AuthGate::default();
+        let now = Instant::now();
+        for n in 0..AUTH_GATE_MAX {
+            gate.ghi_sai(IpAddr::from((n as u32).to_be_bytes()), now);
+        }
+        let sau = now + AUTH_FORGET + Duration::from_secs(1);
+        gate.ghi_sai(ip(9), sau);
+        assert_eq!(gate.fails.len(), 1);
+    }
 }

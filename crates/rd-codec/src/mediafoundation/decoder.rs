@@ -246,8 +246,8 @@ impl MfDecoder {
         } else {
             let buffer = unsafe { MFCreateMemoryBuffer(info.cbSize.max(1)) }
                 .map_err(|err| system("cấp buffer cho frame ra", err))?;
-            let sample =
-                unsafe { MFCreateSample() }.map_err(|err| system("cấp sample cho frame ra", err))?;
+            let sample = unsafe { MFCreateSample() }
+                .map_err(|err| system("cấp sample cho frame ra", err))?;
             unsafe { sample.AddBuffer(&buffer) }
                 .map_err(|err| system("gắn buffer vào sample ra", err))?;
             Some(sample)
@@ -289,7 +289,8 @@ impl MfDecoder {
     fn negotiate_output(&mut self) -> Result<()> {
         let mut chosen = None;
         for index in 0.. {
-            let Ok(media_type) = (unsafe { self.transform.GetOutputAvailableType(0, index) }) else {
+            let Ok(media_type) = (unsafe { self.transform.GetOutputAvailableType(0, index) })
+            else {
                 break;
             };
             if unsafe { media_type.GetGUID(&MF_MT_SUBTYPE) }.ok() == Some(MFVideoFormat_NV12) {
@@ -356,12 +357,7 @@ fn subtype(codec: Codec) -> Result<GUID> {
     }
 }
 
-fn set_input_type(
-    transform: &IMFTransform,
-    codec: Codec,
-    width: u32,
-    height: u32,
-) -> Result<()> {
+fn set_input_type(transform: &IMFTransform, codec: Codec, width: u32, height: u32) -> Result<()> {
     let subtype = subtype(codec)?;
     let media_type = unsafe { windows::Win32::Media::MediaFoundation::MFCreateMediaType() }
         .map_err(|err| system("tạo kiểu dữ liệu vào", err))?;

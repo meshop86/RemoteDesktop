@@ -488,7 +488,10 @@ mod tests {
             TransferState::Failed { .. }
         ));
         // Cái đã xong vẫn xong.
-        assert_eq!(t.get(done).unwrap().state, TransferState::Done { path: None });
+        assert_eq!(
+            t.get(done).unwrap().state,
+            TransferState::Done { path: None }
+        );
     }
 
     #[test]

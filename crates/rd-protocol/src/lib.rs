@@ -30,7 +30,9 @@ pub const MAX_VIDEO_PAYLOAD: usize = MAX_DATAGRAM_SIZE - VIDEO_HEADER_LEN;
 ///
 /// 2: lời chào của viewer mang thêm danh sách codec nó giải mã được.
 /// 3: thêm thông điệp đồng bộ clipboard ở cả hai chiều.
-pub const PROTOCOL_VERSION: u16 = 3;
+/// 4: `auth` trong lời chào buộc vào đúng kết nối TLS đang dùng, nên không
+///    còn phát lại được sang kết nối khác.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -44,6 +46,8 @@ pub enum ProtocolError {
     Decode(#[from] postcard::Error),
     #[error("phiên bản giao thức không khớp: ta {ours}, đối phương {theirs}")]
     VersionMismatch { ours: u16, theirs: u16 },
+    #[error("header video vô lý: mảnh {idx}/{count}")]
+    BadFragmenting { idx: u16, count: u16 },
 }
 
 pub type Result<T> = std::result::Result<T, ProtocolError>;
