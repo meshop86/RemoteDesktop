@@ -744,11 +744,87 @@ pub fn autostart_enabled() -> bool {
     launch_agent().map(|path| path.exists()).unwrap_or(false)
 }
 
+/// Chỗ đang chạy có còn ở đó sau khi khởi động lại máy không.
+///
+/// Mục tự khởi động chỉ ghi được một đường dẫn. Ghi đường dẫn của một bản đang
+/// nằm trong file .dmg vừa mở, hay trong thư mục tạm mà Windows bung ra khi bấm
+/// thẳng vào file .zip, thì máy có điện lại sẽ không tìm thấy gì để chạy — mà
+/// người dùng lại đinh ninh là đã bật rồi.
+fn cho_khong_ben(exe: &Path) -> Option<String> {
+    let duong = exe.to_string_lossy().replace('\\', "/");
+    let keo_vao = "Kéo phần mềm vào thư mục Ứng dụng rồi mở lại từ đó.";
+    // macOS chép ứng dụng mới tải về sang một chỗ tạm rồi chạy ở đó; chỗ ấy
+    // biến mất ngay khi đóng ứng dụng.
+    if duong.contains("/AppTranslocation/") {
+        return Some(format!(
+            "macOS đang chạy phần mềm từ một bản chép tạm vì nó mới tải về. {keo_vao}"
+        ));
+    }
+    if duong.contains("/Temp/") || duong.contains("/tmp/") {
+        return Some(
+            "phần mềm đang chạy từ thư mục tạm (mở thẳng trong file .zip). Giải nén ra một \
+             thư mục cố định rồi chạy từ đó."
+                .to_string(),
+        );
+    }
+    if o_dia_chi_doc(exe) {
+        return Some(format!(
+            "phần mềm đang chạy từ một ổ đĩa chỉ đọc — thường là file .dmg vừa mở. {keo_vao}"
+        ));
+    }
+    None
+}
+
+/// Chỗ chứa phần mềm có phải ổ chỉ đọc không, dò bằng cách thử tạo một tệp.
+///
+/// Không nhìn đường dẫn mà đoán: dưới `/Volumes` có cả ổ cứng ngoài dùng hằng
+/// ngày lẫn file .dmg vừa gắn, hai thứ khác hẳn nhau. Chỉ khi hệ điều hành trả
+/// lời "ổ này chỉ đọc" mới coi là chỗ không bền; không ghi được vì lý do khác
+/// thì cứ cho qua — thà bật nhầm còn hơn chặn oan.
+fn o_dia_chi_doc(exe: &Path) -> bool {
+    let Some(thu_muc) = exe.parent() else {
+        return false;
+    };
+    let thu = thu_muc.join(".rd-thu-ghi");
+    match std::fs::write(&thu, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&thu);
+            false
+        }
+        Err(err) => err.kind() == std::io::ErrorKind::ReadOnlyFilesystem,
+    }
+}
+
+/// Có gì cản chuyện "máy bật lại là tự chia sẻ tiếp" không, nói bằng một câu.
+///
+/// Hỏi trước khi người dùng bấm, vì hai cảnh hay gặp đều im lặng: chạy thẳng
+/// từ file .dmg vừa mở, và mục tự khởi động từ lần trước còn trỏ tới một bản
+/// khác đã bị xoá hoặc đổi chỗ.
+pub fn canh_bao_tu_khoi_dong() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    if let Some(ly_do) = cho_khong_ben(&exe) {
+        return Some(ly_do);
+    }
+    if !autostart_enabled() {
+        return None;
+    }
+    let dang_ghi = autostart_value()?;
+    let duong = exe.display().to_string();
+    (!dang_ghi.contains(&duong)).then(|| {
+        "mục tự khởi động đang trỏ tới một bản khác chứ không phải bản đang chạy — bỏ đánh \
+         dấu rồi đánh dấu lại để ghi đè."
+            .to_string()
+    })
+}
+
 /// Bật/tắt tự khởi động. Trả lỗi dưới dạng câu tiếng Việt để hiện thẳng lên
 /// giao diện.
 pub fn set_autostart(on: bool) -> Result<(), String> {
     let exe =
         std::env::current_exe().map_err(|err| format!("không biết đường dẫn phần mềm: {err}"))?;
+    if on && let Some(ly_do) = cho_khong_ben(&exe) {
+        return Err(ly_do);
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -794,6 +870,9 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
             std::fs::create_dir_all(dir)
                 .map_err(|err| format!("không tạo được {}: {err}", dir.display()))?;
         }
+        // Ghi tệp là đủ: launchd đọc thư mục LaunchAgents ở mỗi lần đăng
+        // nhập. Không nạp ngay bằng `launchctl` — nạp là nó chạy luôn một bản
+        // nữa ở chế độ ngầm, trong khi bản người dùng đang dùng vẫn mở.
         std::fs::write(&path, launch_agent_plist(&exe))
             .map_err(|err| format!("không ghi được {}: {err}", path.display()))
     }
@@ -822,6 +901,9 @@ fn launch_agent_plist(exe: &Path) -> String {
   <key>ProgramArguments</key>
   <array><string>{}</string><string>--background</string></array>
   <key>RunAtLoad</key><true/>
+  <!-- Thoát bất thường (treo, bị kill) thì cho lên lại; người dùng tự thoát
+       thì thôi, đừng dựng dậy trước mặt họ. -->
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
 </dict>
 </plist>
 "#,
@@ -838,6 +920,28 @@ fn launch_agent() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bật tự khởi động cho một bản đang chạy từ file .dmg vừa mở là hứa suông:
+    /// khởi động lại máy thì ổ đĩa ấy không còn.
+    #[test]
+    fn khong_hua_tu_khoi_dong_cho_ban_chay_tam() {
+        let tam = Path::new(r"C:\Users\hoa\AppData\Local\Temp\rd\remote-desktop.exe");
+        assert!(cho_khong_ben(tam).is_some());
+        let treo = Path::new(
+            "/private/var/folders/x/AppTranslocation/abc/d/Remote Desktop.app/Contents/MacOS/rd",
+        );
+        assert!(cho_khong_ben(treo).is_some());
+    }
+
+    /// Ổ ghi được thì đừng chặn — nhất là ổ ngoài gắn ở `/Volumes`, nhiều người
+    /// để cả thư mục làm việc ở đấy.
+    #[test]
+    fn cho_ghi_duoc_thi_bat_duoc() {
+        let thu_muc = std::env::temp_dir().join("rd-thu-cho-ben");
+        std::fs::create_dir_all(&thu_muc).expect("tạo thư mục thử");
+        assert!(!o_dia_chi_doc(&thu_muc.join("remote-desktop")));
+        let _ = std::fs::remove_dir_all(&thu_muc);
+    }
 
     /// Máy khác đang giữ khoá clipboard vài chục mili giây là chuyện thường
     /// trên Windows; hỏng nhịp đầu mà bỏ luôn thì đoạn văn bản mất hẳn.

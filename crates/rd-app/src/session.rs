@@ -97,6 +97,11 @@ const CHROME_KEY: egui::Key = egui::Key::F12;
 /// Chỗ phần bên trái thanh công cụ chiếm: thoát phiên, trạng thái, tên máy kia.
 const BE_NGANG_THANH_TRAI: f32 = 380.0;
 
+/// Bề ngang bảng chat/tệp: mặc định, hẹp nhất, và rộng nhất người kéo ra được.
+const BANG_RONG: f32 = 320.0;
+const BANG_HEP: f32 = 240.0;
+const BANG_RONG_TOI_DA: f32 = 420.0;
+
 const REVEAL_EDGE: f32 = 6.0;
 
 /// Chờ bao lâu trước lần nối lại đầu tiên.
@@ -365,6 +370,13 @@ pub struct SessionState {
     hide_chrome: bool,
     /// Số tệp đang lơ lửng trên cửa sổ chờ thả.
     hovering_files: usize,
+    /// Máy này có tự mở lại phần mềm ở chế độ chia sẻ sau khi bật máy không.
+    /// Hỏi hệ điều hành một lần lúc vào phiên, vì mỗi lần hỏi là một tiến trình
+    /// con — không gọi được trong vòng vẽ.
+    tu_khoi_dong: bool,
+    /// Lý do bật tự khởi động không thành, hoặc thứ đang cản nó chạy được ở
+    /// lần bật máy sau. Hiện ngay dưới ô đánh dấu.
+    loi_tu_khoi_dong: Option<String>,
     fullscreen: bool,
     /// Trạng thái toàn màn hình đã báo cho hệ điều hành. Lệch với `fullscreen`
     /// là còn một lệnh phải gửi — gửi mỗi khung thì cửa sổ giật liên tục.
@@ -439,6 +451,10 @@ impl SessionState {
             show_panel: true,
             hide_chrome: prefs.hide_chrome,
             hovering_files: 0,
+            tu_khoi_dong: matches!(role, Role::Host) && crate::os::autostart_enabled(),
+            loi_tu_khoi_dong: matches!(role, Role::Host)
+                .then(crate::os::canh_bao_tu_khoi_dong)
+                .flatten(),
             fullscreen: prefs.start_fullscreen,
             fullscreen_applied: false,
             prefs,
@@ -800,7 +816,12 @@ impl SessionState {
 
         if self.show_panel && show_chrome {
             egui::Panel::right("bảng")
-                .default_size(320.0)
+                .default_size(BANG_RONG)
+                // Chặn hai đầu: bảng nào cũng nở ra vừa nội dung, nên chỉ cần
+                // một thứ bên trong xin rộng hơn — thanh tiến độ, một cái tên
+                // file dài — là bảng lấn sang phần hình rồi ở lì đấy, vì bề
+                // ngang được nhớ lại cho lần mở sau.
+                .size_range(BANG_HEP..=BANG_RONG_TOI_DA)
                 .show(root, |ui| self.draw_panel(ui));
         }
 
@@ -1061,6 +1082,44 @@ impl SessionState {
         }
     }
 
+    /// Ô đánh dấu "máy có điện lại là tự chia sẻ tiếp".
+    ///
+    /// Để ngay trên thẻ chia sẻ chứ không giấu trong trang cài đặt: đây đúng
+    /// lúc người dùng đang nghĩ tới chuyện đi khỏi máy này.
+    fn o_tu_khoi_dong(&mut self, ui: &mut egui::Ui) {
+        let mut bat = self.tu_khoi_dong;
+        let o = ui
+            .checkbox(&mut bat, "Máy bật lại là tự chia sẻ tiếp")
+            .on_hover_text(
+                "Mất điện hay khởi động lại: đăng nhập xong là phần mềm tự lên, cửa sổ thu \
+                 nhỏ sẵn, tự mở chia sẻ với đúng mật khẩu và cổng đang hiện ở đây. Máy phải \
+                 đăng nhập được vào tài khoản này thì mới chia sẻ được — dừng ở màn hình \
+                 khoá là chưa có gì chạy. Đánh dấu ở đây có hiệu lực từ lần đăng nhập sau.",
+            );
+        if o.changed() {
+            match crate::os::set_autostart(bat) {
+                Ok(()) => {
+                    self.tu_khoi_dong = bat;
+                    self.loi_tu_khoi_dong = bat.then(crate::os::canh_bao_tu_khoi_dong).flatten();
+                }
+                Err(err) => self.loi_tu_khoi_dong = Some(err),
+            }
+        }
+        match &self.loi_tu_khoi_dong {
+            Some(err) => {
+                ui.label(egui::RichText::new(err).small().color(ui::BAD));
+            }
+            None if self.tu_khoi_dong => {
+                ui.label(
+                    egui::RichText::new("đã đăng ký với hệ điều hành")
+                        .small()
+                        .color(ui::GOOD),
+                );
+            }
+            None => {}
+        }
+    }
+
     fn draw_host_card(&mut self, ui: &mut egui::Ui) {
         let outer = ui.max_rect();
         ui::paint_backdrop(ui, outer);
@@ -1127,6 +1186,11 @@ impl SessionState {
                     if ui.button("Chép mật khẩu").clicked() {
                         ui.ctx().copy_text(self.password.clone());
                     }
+
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(12.0);
+                    self.o_tu_khoi_dong(ui);
                 });
 
             ui.add_space(20.0);
@@ -1214,14 +1278,17 @@ impl SessionState {
                         Direction::Out => "gửi",
                         Direction::In => "nhận",
                     };
+                    // Tên file dài thì cắt bớt: để nguyên là nó đòi cả một dòng
+                    // rõ rộng, bảng nở ra theo, phần hình co lại.
                     ui.label(
                         egui::RichText::new(format!(
                             "{arrow} {}  ({})",
-                            item.name,
+                            ui::rut_gon(&item.name, 34),
                             ui::bytes(item.size)
                         ))
                         .small(),
-                    );
+                    )
+                    .on_hover_text(&item.name);
                     match &item.state {
                         TransferState::Offered if item.direction == Direction::In => {
                             ui.horizontal(|ui| {
@@ -1243,10 +1310,14 @@ impl SessionState {
                         }
                         TransferState::Active => {
                             ui.horizontal(|ui| {
+                                // Lấy bề ngang khung cha chứ đừng lấy chỗ còn
+                                // trống: chỗ trống nở theo bảng, bảng lại nở
+                                // theo thanh này — hai bên đẩy nhau rộng mãi.
+                                let rong = (ui.max_rect().width() - 52.0).clamp(48.0, 320.0);
                                 ui.add(
                                     egui::ProgressBar::new(item.ratio())
                                         .text(format!("{}/s", ui::bytes(item.rate() as u64)))
-                                        .desired_width(ui.available_width() - 52.0),
+                                        .desired_width(rong),
                                 );
                                 if ui.small_button("Huỷ").clicked() {
                                     cancel = Some(item.id);
@@ -1482,5 +1553,50 @@ mod tests {
         t.finish(1, Some(PathBuf::from("/tmp/a.bin")));
         t.cancel(1, false);
         assert!(matches!(t.list()[0].state, TransferState::Done(_)));
+    }
+}
+
+#[cfg(test)]
+mod tests_bang {
+    use super::{BANG_RONG, BANG_RONG_TOI_DA};
+    use std::sync::{Arc, Mutex};
+
+    /// Bảng chat/tệp không được để nội dung bên trong đẩy rộng ra, nếu không
+    /// một cái tên file dài hay thanh tiến độ sẽ ăn dần phần hình.
+    #[test]
+    fn noi_dung_rong_khong_lam_no_bang() {
+        let ctx = egui::Context::default();
+        let rong: Arc<Mutex<Vec<f32>>> = Arc::default();
+        for _ in 0..6 {
+            let rong = rong.clone();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ctx| {
+                egui::Panel::right("bảng")
+                    .default_size(BANG_RONG)
+                    .size_range(super::BANG_HEP..=BANG_RONG_TOI_DA)
+                    .show(ctx, |ui| {
+                        rong.lock()
+                            .expect("bề ngang bảng")
+                            .push(ui.max_rect().width());
+                        ui.add(egui::ProgressBar::new(0.5).desired_width(2000.0));
+                        ui.horizontal(|ui| ui.label("một cái tên file dài kinh khủng".repeat(8)));
+                    });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label("hình");
+                });
+            });
+            out.textures_delta.clear();
+        }
+        let rong = rong.lock().expect("bề ngang bảng");
+        assert!(
+            rong.iter().all(|w| *w <= BANG_RONG_TOI_DA),
+            "bảng nở quá mức: {rong:?}"
+        );
     }
 }

@@ -2432,7 +2432,7 @@ dependencies = [
 
 [[package]]
 name = "rd-app"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2461,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "rd-capture"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "block2 0.6.2",
  "dispatch2",
@@ -2481,7 +2481,7 @@ dependencies = [
 
 [[package]]
 name = "rd-codec"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "objc2 0.6.4",
  "objc2-core-foundation",
@@ -2498,7 +2498,7 @@ dependencies = [
 
 [[package]]
 name = "rd-input"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "objc2-core-foundation",
  "objc2-core-graphics",
@@ -2510,7 +2510,7 @@ dependencies = [
 
 [[package]]
 name = "rd-protocol"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "bytes",
  "postcard",
@@ -2520,7 +2520,7 @@ dependencies = [
 
 [[package]]
 name = "rd-session"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "rd-protocol",
  "tracing",
@@ -2528,7 +2528,7 @@ dependencies = [
 
 [[package]]
 name = "rd-signal"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "anyhow",
  "parking_lot",
@@ -2545,7 +2545,7 @@ dependencies = [
 
 [[package]]
 name = "rd-transport"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "blake3",
  "bytes",
@@ -2563,7 +2563,7 @@ dependencies = [
 
 [[package]]
 name = "rd-viewer"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "anyhow",
  "eframe",
