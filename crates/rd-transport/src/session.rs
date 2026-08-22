@@ -20,6 +20,47 @@ pub const MAX_CONTROL_MESSAGE: usize = 1024 * 1024;
 /// giống hệt nhau — sửa ở đây thì phải nâng `PROTOCOL_VERSION`.
 const CHANNEL_BINDING_LABEL: &[u8] = b"rd-auth-v1";
 
+/// Lời chào mở đầu kênh control: bốn chữ nhận dạng rồi số hiệu giao thức.
+///
+/// Có nó thì hai bản lệch nhau nói được ngay là lệch bản. Không có nó, đầu kia
+/// cứ thế đọc byte lạ thành message rồi báo "lỗi giải mã" — chẳng ai đoán ra.
+/// Bản cũ chưa biết lời chào sẽ đọc bốn byte đầu thành độ dài hơn một tỉ, nên
+/// nó kêu "message quá lớn" rồi dừng, chứ không đứng chờ mãi.
+const CONTROL_MAGIC: [u8; 4] = *b"RDCT";
+const CONTROL_PREAMBLE_LEN: usize = CONTROL_MAGIC.len() + 2;
+
+fn tao_loi_chao() -> [u8; CONTROL_PREAMBLE_LEN] {
+    let mut chao = [0u8; CONTROL_PREAMBLE_LEN];
+    chao[..CONTROL_MAGIC.len()].copy_from_slice(&CONTROL_MAGIC);
+    chao[CONTROL_MAGIC.len()..].copy_from_slice(&rd_protocol::PROTOCOL_VERSION.to_le_bytes());
+    chao
+}
+
+fn kiem_loi_chao(chao: &[u8; CONTROL_PREAMBLE_LEN]) -> Result<(), TransportError> {
+    if chao[..CONTROL_MAGIC.len()] != CONTROL_MAGIC {
+        return Err(TransportError::NotOurProtocol);
+    }
+    let dau_kia = u16::from_le_bytes([chao[4], chao[5]]);
+    if dau_kia != rd_protocol::PROTOCOL_VERSION {
+        return Err(TransportError::VersionMismatch {
+            cua_ta: rd_protocol::PROTOCOL_VERSION,
+            dau_kia,
+        });
+    }
+    Ok(())
+}
+
+async fn gui_loi_chao(send: &mut SendStream) -> Result<(), TransportError> {
+    send.write_all(&tao_loi_chao()).await?;
+    Ok(())
+}
+
+async fn doc_loi_chao(recv: &mut RecvStream) -> Result<(), TransportError> {
+    let mut chao = [0u8; CONTROL_PREAMBLE_LEN];
+    recv.read_exact(&mut chao).await?;
+    kiem_loi_chao(&chao)
+}
+
 #[derive(Clone)]
 pub struct Session {
     conn: Connection,
@@ -79,7 +120,11 @@ impl Session {
         Tx: Serialize,
         Rx: DeserializeOwned,
     {
-        let (send, recv) = self.conn.open_bi().await?;
+        let (mut send, mut recv) = self.conn.open_bi().await?;
+        // Bên mở chào trước: `open_bi` chưa tạo stream ở đầu kia cho tới lần ghi
+        // đầu tiên, nên chào xong mới có cái để đọc.
+        gui_loi_chao(&mut send).await?;
+        doc_loi_chao(&mut recv).await?;
         Ok((ControlSender::new(send), ControlReceiver::new(recv)))
     }
 
@@ -91,7 +136,9 @@ impl Session {
         Tx: Serialize,
         Rx: DeserializeOwned,
     {
-        let (send, recv) = self.conn.accept_bi().await?;
+        let (mut send, mut recv) = self.conn.accept_bi().await?;
+        doc_loi_chao(&mut recv).await?;
+        gui_loi_chao(&mut send).await?;
         Ok((ControlSender::new(send), ControlReceiver::new(recv)))
     }
 
@@ -322,5 +369,43 @@ impl<T: DeserializeOwned> ControlReceiver<T> {
         self.buf.resize(len, 0);
         self.stream.read_exact(&mut self.buf).await?;
         Ok(postcard::from_bytes(&self.buf)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loi_chao_cua_chinh_minh_thi_hop_le() {
+        assert!(kiem_loi_chao(&tao_loi_chao()).is_ok());
+    }
+
+    #[test]
+    fn lech_ban_thi_noi_ro_la_lech_ban() {
+        let mut chao = tao_loi_chao();
+        chao[4] = chao[4].wrapping_add(1);
+        let Err(TransportError::VersionMismatch { dau_kia, .. }) = kiem_loi_chao(&chao) else {
+            panic!("phải nhận ra hai bên lệch số hiệu giao thức");
+        };
+        assert_ne!(dau_kia, rd_protocol::PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn byte_la_thi_khong_nhan_la_nguoi_nha() {
+        let chao = [0u8; CONTROL_PREAMBLE_LEN];
+        assert!(matches!(
+            kiem_loi_chao(&chao),
+            Err(TransportError::NotOurProtocol)
+        ));
+    }
+
+    /// Bản cũ chưa biết lời chào sẽ đọc bốn byte đầu thành độ dài message.
+    /// Nó phải thấy con số vượt trần để kêu lên ngay, thay vì ngồi đợi.
+    #[test]
+    fn ban_cu_doc_loi_chao_thanh_do_dai_qua_tran() {
+        let chao = tao_loi_chao();
+        let do_dai = u32::from_le_bytes([chao[0], chao[1], chao[2], chao[3]]) as usize;
+        assert!(do_dai > MAX_CONTROL_MESSAGE);
     }
 }

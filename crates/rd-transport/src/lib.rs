@@ -66,6 +66,12 @@ pub enum TransportError {
     FileHashMismatch(String),
     #[error("đầu kia huỷ nhận file (mã {0})")]
     FileRejected(u64),
+    #[error(
+        "hai máy chạy hai bản khác nhau: máy này giao thức {cua_ta}, đầu kia {dau_kia} — cài cùng một phiên bản ứng dụng cho cả hai máy"
+    )]
+    VersionMismatch { cua_ta: u16, dau_kia: u16 },
+    #[error("đầu kia không phải RemoteDesktop, hoặc là một bản quá cũ")]
+    NotOurProtocol,
     #[error("lỗi giải mã message: {0}")]
     Decode(#[from] postcard::Error),
     #[error("message quá lớn: {0} byte")]

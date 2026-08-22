@@ -94,6 +94,9 @@ const FULLSCREEN_KEY: egui::Key = egui::Key::F11;
 const CHROME_KEY: egui::Key = egui::Key::F12;
 
 /// Chuột lên sát mép trên bao nhiêu pixel thì thanh công cụ hiện lại.
+/// Chỗ phần bên trái thanh công cụ chiếm: thoát phiên, trạng thái, tên máy kia.
+const BE_NGANG_THANH_TRAI: f32 = 380.0;
+
 const REVEAL_EDGE: f32 = 6.0;
 
 /// Chờ bao lâu trước lần nối lại đầu tiên.
@@ -738,136 +741,61 @@ impl SessionState {
 
         if show_chrome {
             egui::Panel::top("thanh").show(root, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Thoát phiên").clicked() {
-                    outcome = Outcome::Leave;
-                }
-                ui.separator();
-                ui.label(match self.role {
-                    Role::Host => "Đang chia sẻ máy này",
-                    Role::Viewer => "Đang xem máy khác",
-                });
-                ui.separator();
-                let cho_noi_lai = self.retry_at.map(|luc| luc.saturating_duration_since(Instant::now()));
-                let nhan_cho;
-                let (dot, color) = if let Some(cho) = cho_noi_lai {
-                    nhan_cho = format!("nối lại sau {:.0}s", cho.as_secs_f32().ceil());
-                    (nhan_cho.as_str(), ui::WARN)
-                } else if self.ended.is_some() {
-                    ("đã dừng", ui::BAD)
-                } else if self.connected() {
-                    ("đã nối", ui::GOOD)
-                } else {
-                    ("đang chờ", ui::WARN)
-                };
-                ui.colored_label(color, dot);
-                if let Some(name) = &self.peer {
-                    ui.label(name);
-                }
-                if self.retry_at.is_some() {
-                    if ui.small_button("Thử ngay").clicked() {
+                // Cửa sổ hẹp thì cho nhóm nút bên phải xuống hàng riêng. Layout
+                // phải-sang-trái không biết co lại: hết chỗ là nó vẽ đè lên phần
+                // bên trái, thành một mớ chữ chồng lên nhau.
+                let mot_hang =
+                    ui.available_width() >= self.be_ngang_thanh_phai() + BE_NGANG_THANH_TRAI;
+                ui.horizontal(|ui| {
+                    if ui.button("Thoát phiên").clicked() {
+                        outcome = Outcome::Leave;
+                    }
+                    ui.separator();
+                    ui.label(match self.role {
+                        Role::Host => "Đang chia sẻ máy này",
+                        Role::Viewer => "Đang xem máy khác",
+                    });
+                    ui.separator();
+                    let cho_noi_lai = self
+                        .retry_at
+                        .map(|luc| luc.saturating_duration_since(Instant::now()));
+                    let nhan_cho;
+                    let (dot, color) = if let Some(cho) = cho_noi_lai {
+                        nhan_cho = format!("nối lại sau {:.0}s", cho.as_secs_f32().ceil());
+                        (nhan_cho.as_str(), ui::WARN)
+                    } else if self.ended.is_some() {
+                        ("đã dừng", ui::BAD)
+                    } else if self.connected() {
+                        ("đã nối", ui::GOOD)
+                    } else {
+                        ("đang chờ", ui::WARN)
+                    };
+                    ui.colored_label(color, dot);
+                    if let Some(name) = &self.peer {
+                        ui.label(name);
+                    }
+                    if self.retry_at.is_some() {
+                        if ui.small_button("Thử ngay").clicked() {
+                            self.retry_at = Some(Instant::now());
+                        }
+                        if ui.small_button("Thôi").clicked() {
+                            self.retry_at = None;
+                        }
+                    } else if self.ended.is_some() && ui.small_button("Nối lại").clicked() {
+                        self.attempts = 0;
                         self.retry_at = Some(Instant::now());
                     }
-                    if ui.small_button("Thôi").clicked() {
-                        self.retry_at = None;
-                    }
-                } else if self.ended.is_some() && ui.small_button("Nối lại").clicked() {
-                    self.attempts = 0;
-                    self.retry_at = Some(Instant::now());
-                }
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let label = if self.unread > 0 {
-                        format!("Chat/Tệp ({})", self.unread)
-                    } else {
-                        "Chat/Tệp".to_string()
-                    };
-                    if ui.selectable_label(self.show_panel, label).clicked() {
-                        self.show_panel = !self.show_panel;
-                        if self.show_panel {
-                            self.unread = 0;
-                        }
-                    }
-                    if self.role == Role::Viewer && self.monitors.len() > 1 {
-                        // Chỉ hiện khi máy kia có nhiều hơn một màn hình; một
-                        // màn hình mà vẫn bày ô chọn thì chỉ tổ chiếm chỗ.
-                        let hien_tai = self
-                            .monitors
-                            .iter()
-                            .find(|m| m.id == self.active_monitor)
-                            .map(|m| m.name.clone())
-                            .unwrap_or_else(|| "Màn hình".into());
-                        let mut chon = None;
-                        egui::ComboBox::from_id_salt("man-hinh")
-                            .selected_text(hien_tai)
-                            .show_ui(ui, |ui| {
-                                for man in &self.monitors {
-                                    let nhan = format!(
-                                        "{} — {}x{}{}",
-                                        man.name,
-                                        man.width,
-                                        man.height,
-                                        if man.is_primary { " (chính)" } else { "" }
-                                    );
-                                    if ui
-                                        .selectable_label(man.id == self.active_monitor, nhan)
-                                        .clicked()
-                                    {
-                                        chon = Some(man.id);
-                                    }
-                                }
-                            });
-                        if let Some(id) = chon.filter(|id| *id != self.active_monitor) {
-                            self.active_monitor = id;
-                            self.net.send(UiCommand::SelectMonitor(id));
-                            self.status = "đang đổi màn hình…".into();
-                        }
-                    }
-                    if self.role == Role::Viewer {
-                        let text = if self.control_on {
-                            "Điều khiển: bật (F9)"
-                        } else {
-                            "Điều khiển: tắt (F9)"
-                        };
-                        if ui.selectable_label(self.control_on, text).clicked() {
-                            self.control_on = !self.control_on;
-                        }
-                        if ui.button("Yêu cầu keyframe").clicked() {
-                            self.net.send(UiCommand::RequestKeyframe);
-                        }
-                        ui.label("kbps tối đa");
-                        // Là *trần*, không phải mức phát: máy kia tự dò xem
-                        // đường truyền tải nổi bao nhiêu rồi phát trong khoảng
-                        // đó. Hạ trần vẫn có ích khi muốn nhường băng thông cho
-                        // việc khác, hoặc khi đang dùng gói dữ liệu tính theo GB.
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut self.bitrate_kbps)
-                                    .range(1_000..=200_000)
-                                    .speed(500),
-                            )
-                            .on_hover_text(
-                                "Trần băng thông. Máy kia tự dò mức thật theo độ trễ và tỉ lệ mất gói.",
-                            )
-                            .changed()
-                        {
-                            self.net.send(UiCommand::SetBitrate(self.bitrate_kbps));
-                        }
-                        let full = if self.fullscreen { "Thu nhỏ (F11)" } else { "Toàn màn hình (F11)" };
-                        if ui.selectable_label(self.fullscreen, full).clicked() {
-                            self.fullscreen = !self.fullscreen;
-                        }
-                        if ui
-                            .selectable_label(self.hide_chrome, "Ẩn thanh (F12)")
-                            .on_hover_text("Đưa chuột lên sát mép trên là thanh hiện lại.")
-                            .clicked()
-                        {
-                            self.hide_chrome = !self.hide_chrome;
-                        }
+                    if mot_hang {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            self.thanh_phai(ui);
+                        });
                     }
                 });
+                if !mot_hang {
+                    ui.horizontal(|ui| self.thanh_phai(ui));
+                }
             });
-        });
         }
 
         if self.show_panel && show_chrome {
@@ -892,6 +820,116 @@ impl SessionState {
             });
 
         outcome
+    }
+
+    /// Nhóm nút bên phải thanh công cụ: chat, chọn màn hình, và các nút của
+    /// người đang xem.
+    fn thanh_phai(&mut self, ui: &mut egui::Ui) {
+        let label = if self.unread > 0 {
+            format!("Chat/Tệp ({})", self.unread)
+        } else {
+            "Chat/Tệp".to_string()
+        };
+        if ui.selectable_label(self.show_panel, label).clicked() {
+            self.show_panel = !self.show_panel;
+            if self.show_panel {
+                self.unread = 0;
+            }
+        }
+        if self.role == Role::Viewer && self.monitors.len() > 1 {
+            // Chỉ hiện khi máy kia có nhiều hơn một màn hình; một
+            // màn hình mà vẫn bày ô chọn thì chỉ tổ chiếm chỗ.
+            let hien_tai = self
+                .monitors
+                .iter()
+                .find(|m| m.id == self.active_monitor)
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| "Màn hình".into());
+            let mut chon = None;
+            egui::ComboBox::from_id_salt("man-hinh")
+                .selected_text(hien_tai)
+                .show_ui(ui, |ui| {
+                    for man in &self.monitors {
+                        let nhan = format!(
+                            "{} — {}x{}{}",
+                            man.name,
+                            man.width,
+                            man.height,
+                            if man.is_primary { " (chính)" } else { "" }
+                        );
+                        if ui
+                            .selectable_label(man.id == self.active_monitor, nhan)
+                            .clicked()
+                        {
+                            chon = Some(man.id);
+                        }
+                    }
+                });
+            if let Some(id) = chon.filter(|id| *id != self.active_monitor) {
+                self.active_monitor = id;
+                self.net.send(UiCommand::SelectMonitor(id));
+                self.status = "đang đổi màn hình…".into();
+            }
+        }
+        if self.role == Role::Viewer {
+            let text = if self.control_on {
+                "Điều khiển: bật (F9)"
+            } else {
+                "Điều khiển: tắt (F9)"
+            };
+            if ui.selectable_label(self.control_on, text).clicked() {
+                self.control_on = !self.control_on;
+            }
+            if ui.button("Yêu cầu keyframe").clicked() {
+                self.net.send(UiCommand::RequestKeyframe);
+            }
+            ui.label("kbps tối đa");
+            // Là *trần*, không phải mức phát: máy kia tự dò xem
+            // đường truyền tải nổi bao nhiêu rồi phát trong khoảng
+            // đó. Hạ trần vẫn có ích khi muốn nhường băng thông cho
+            // việc khác, hoặc khi đang dùng gói dữ liệu tính theo GB.
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.bitrate_kbps)
+                        .range(1_000..=200_000)
+                        .speed(500),
+                )
+                .on_hover_text(
+                    "Trần băng thông. Máy kia tự dò mức thật theo độ trễ và tỉ lệ mất gói.",
+                )
+                .changed()
+            {
+                self.net.send(UiCommand::SetBitrate(self.bitrate_kbps));
+            }
+            let full = if self.fullscreen {
+                "Thu nhỏ (F11)"
+            } else {
+                "Toàn màn hình (F11)"
+            };
+            if ui.selectable_label(self.fullscreen, full).clicked() {
+                self.fullscreen = !self.fullscreen;
+            }
+            if ui
+                .selectable_label(self.hide_chrome, "Ẩn thanh (F12)")
+                .on_hover_text("Đưa chuột lên sát mép trên là thanh hiện lại.")
+                .clicked()
+            {
+                self.hide_chrome = !self.hide_chrome;
+            }
+        }
+    }
+
+    /// Ước lượng bề ngang nhóm ấy cần, để biết có nhét chung một hàng được không.
+    fn be_ngang_thanh_phai(&self) -> f32 {
+        let mut can = 130.0;
+        if self.role == Role::Viewer {
+            // Điều khiển, keyframe, trần kbps, toàn màn hình, ẩn thanh.
+            can += 540.0;
+            if self.monitors.len() > 1 {
+                can += 170.0;
+            }
+        }
+        can
     }
 
     fn draw_video(&mut self, ui: &mut egui::Ui) {

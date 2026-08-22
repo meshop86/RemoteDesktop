@@ -32,7 +32,7 @@ pub const MAX_VIDEO_PAYLOAD: usize = MAX_DATAGRAM_SIZE - VIDEO_HEADER_LEN;
 /// 3: thêm thông điệp đồng bộ clipboard ở cả hai chiều.
 /// 4: `auth` trong lời chào buộc vào đúng kết nối TLS đang dùng, nên không
 ///    còn phát lại được sang kết nối khác.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
