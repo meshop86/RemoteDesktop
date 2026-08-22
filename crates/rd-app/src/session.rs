@@ -46,10 +46,15 @@ struct Address {
 /// Máy nối nhiều mạng cùng lúc (vừa Wi-Fi vừa dây) thì cách này cho ra đường
 /// mặc định, tức đường mà máy kia nhiều khả năng cũng đang ở.
 pub fn lan_ip() -> Option<std::net::Ipv4Addr> {
+    dia_chi_nguon("1.1.1.1")
+}
+
+/// Địa chỉ máy này sẽ mang khi gửi gói tin tới `dich`.
+pub fn dia_chi_nguon(dich: &str) -> Option<std::net::Ipv4Addr> {
     let socket = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
-    // Không có đường ra internet thì `connect` trả lỗi và ta đành chịu — thà
-    // không hiện gì còn hơn hiện một địa chỉ sai.
-    socket.connect(("1.1.1.1", 53)).ok()?;
+    // Không có đường tới đó thì `connect` trả lỗi và ta đành chịu — thà không
+    // hiện gì còn hơn hiện một địa chỉ sai.
+    socket.connect((dich, 53)).ok()?;
     match socket.local_addr().ok()? {
         std::net::SocketAddr::V4(addr) => Some(*addr.ip()),
         std::net::SocketAddr::V6(_) => None,

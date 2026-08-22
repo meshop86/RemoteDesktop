@@ -677,6 +677,14 @@ pub struct RdApp {
 }
 
 /// Cổng đã dùng lần trước khi nối tới đúng địa chỉ này.
+/// Địa chỉ tailnet của máy này khi `tailscale` không chịu trả lời.
+///
+/// Chương trình dòng lệnh lỡ nhịp thì cũng không được giấu mất địa chỉ: đó
+/// đúng là thứ người dùng đang cần đọc cho máy bên kia gõ.
+fn dia_chi_tailnet() -> Option<String> {
+    crate::tailscale::tailnet_ip().map(|ip| ip.to_string())
+}
+
 fn cong_da_dung(recents: &[RecentPeer], ip: &str) -> Option<u16> {
     recents.iter().find_map(|item| {
         let (dia_chi, cong) = item.target.rsplit_once(':')?;
@@ -792,7 +800,11 @@ impl RdApp {
         // Địa chỉ tailnet chỉ có nghĩa khi Tailscale đang chạy; đưa sẵn cho
         // phiên để thẻ host đọc luôn được cả hai đường.
         let snapshot = self.tailscale.snapshot();
-        let tailscale_ip = snapshot.running().then_some(snapshot.self_ip).flatten();
+        let tailscale_ip = snapshot
+            .running()
+            .then_some(snapshot.self_ip)
+            .flatten()
+            .or_else(dia_chi_tailnet);
         match SessionState::start(config, tailscale_ip, self.form.prefs) {
             Ok(state) => {
                 self.error = None;
@@ -898,6 +910,17 @@ impl RdApp {
                 }
                 State::Broken(reason) => {
                     ui.colored_label(ui::BAD, reason);
+                    // Hỏi không được không có nghĩa là không nối được: địa chỉ
+                    // vẫn đọc thẳng từ bảng định tuyến, và người kia gõ vào
+                    // vẫn tới.
+                    if let Some(ip) = crate::tailscale::tailnet_ip() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "máy này vẫn ở {ip}, chia sẻ vẫn dùng được"
+                            ))
+                            .small(),
+                        );
+                    }
                 }
                 State::Running => self.draw_tailnet(ui, &status),
             }
@@ -1171,7 +1194,13 @@ impl RdApp {
                                 .monospace(),
                         );
                     }
-                    if let Some(ip) = self.tailscale.snapshot().self_ip.clone() {
+                    if let Some(ip) = self
+                        .tailscale
+                        .snapshot()
+                        .self_ip
+                        .clone()
+                        .or_else(dia_chi_tailnet)
+                    {
                         ui.label(
                             egui::RichText::new(format!("{ip}:{}  (Tailscale)", self.form.port))
                                 .small()

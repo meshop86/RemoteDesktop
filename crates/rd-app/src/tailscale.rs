@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -218,7 +218,24 @@ fn hide_console(_command: &mut Command) {}
 
 /// Hỏi Tailscale xem tình hình thế nào. Lời gọi này **chặn** — gọi trên luồng
 /// nền, đừng gọi trong lúc vẽ giao diện.
+/// Hỏi Tailscale xem máy này đang ở đâu trong tailnet.
+///
+/// Hỏi hụt một lần thì hỏi lại: bản Tailscale cài từ App Store thỉnh thoảng
+/// chưa kịp trả lời, lần ngay sau đó lại bình thường.
 pub fn status() -> Status {
+    match hoi_trang_thai() {
+        Ok(status) => status,
+        Err(loi) => {
+            std::thread::sleep(Duration::from_millis(400));
+            hoi_trang_thai().unwrap_or(Status {
+                state: Some(State::Broken(loi)),
+                ..Status::default()
+            })
+        }
+    }
+}
+
+fn hoi_trang_thai() -> Result<Status, String> {
     let text = match run(&["status", "--json"]) {
         Ok(text) => text,
         Err(err) => {
@@ -230,24 +247,14 @@ pub fn status() -> Status {
                 State::Stopped
             };
             tracing::debug!(%err, ?state, "không đọc được trạng thái Tailscale");
-            return Status {
+            return Ok(Status {
                 state: Some(state),
                 ..Status::default()
-            };
+            });
         }
     };
 
-    let raw: RawStatus = match serde_json::from_str(&text) {
-        Ok(raw) => raw,
-        Err(err) => {
-            return Status {
-                state: Some(State::Broken(format!(
-                    "không hiểu JSON của tailscale: {err}"
-                ))),
-                ..Status::default()
-            };
-        }
-    };
+    let raw = doc_trang_thai(&text)?;
 
     let state = match raw.backend_state.as_deref() {
         Some("Running") => State::Running,
@@ -277,7 +284,7 @@ pub fn status() -> Status {
         .collect();
     sort_peers(&mut peers);
 
-    Status {
+    Ok(Status {
         state: Some(state),
         self_ip: raw.self_node.as_ref().and_then(RawNode::ipv4),
         self_user_id: raw.self_node.as_ref().and_then(|node| node.user_id),
@@ -288,7 +295,50 @@ pub fn status() -> Status {
             .unwrap_or_default(),
         peers,
         auth_url: raw.auth_url.filter(|url| !url.is_empty()),
+    })
+}
+
+/// Tách JSON ra khỏi những dòng chữ mà `tailscale` đôi khi in kèm.
+///
+/// Bản cài từ App Store có lúc in một câu than bằng tiếng Anh ra stdout rồi
+/// vẫn thoát với mã 0 — chẳng hạn "The Tailscale GUI failed to start" khi ứng
+/// dụng nền chưa sẵn sàng. Ném nguyên văn ấy cho serde thì người dùng nhận
+/// được một lỗi cú pháp JSON khó hiểu, trong khi việc phải làm là mở ứng dụng
+/// Tailscale lên.
+fn doc_trang_thai(text: &str) -> Result<RawStatus, String> {
+    match text.find('{') {
+        Some(dau) => serde_json::from_str(&text[dau..])
+            .map_err(|err| format!("không hiểu JSON của tailscale: {err}")),
+        None => Err(loi_nguoi_doc(text)),
     }
+}
+
+/// Đổi câu than tiếng Anh của Tailscale thành một câu nói rõ phải làm gì.
+fn loi_nguoi_doc(text: &str) -> String {
+    let dong = text
+        .lines()
+        .find(|dong| !dong.trim().is_empty())
+        .unwrap_or_default()
+        .trim();
+    let mo_app = "mở ứng dụng Tailscale rồi bấm Làm mới";
+    if dong.is_empty() {
+        format!("Tailscale không trả lời — {mo_app}")
+    } else {
+        format!("Tailscale chưa trả lời được ({dong}) — {mo_app}")
+    }
+}
+
+/// Địa chỉ 100.x của máy này, đọc thẳng từ bảng định tuyến thay vì hỏi
+/// `tailscale`.
+///
+/// Cùng mẹo với [`crate::session::lan_ip`]: nối một socket UDP tới máy chủ tên
+/// miền của Tailscale — địa chỉ ấy chỉ đi được qua đường hầm, nên địa chỉ
+/// nguồn hệ điều hành chọn chính là địa chỉ tailnet. Cần nó vì chương trình
+/// dòng lệnh có thể lỡ nhịp, mà lúc ấy người dùng vẫn phải đọc được địa chỉ để
+/// đọc cho máy bên kia.
+pub fn tailnet_ip() -> Option<std::net::Ipv4Addr> {
+    let ip = crate::session::dia_chi_nguon("100.100.100.100")?;
+    is_tailnet_ip(ip.into()).then_some(ip)
 }
 
 /// Danh tính của một máy trong tailnet, tra từ địa chỉ `100.x.y.z`.
@@ -495,6 +545,25 @@ fn khoang_cach(moc: &str, bay_gio: i64) -> Option<String> {
     })
 }
 
+/// Đang chạy ngon mà hỏng bao nhiêu lần liên tiếp thì mới chịu tin là hỏng.
+const HONG_TOI_DA: u32 = 3;
+
+/// Có nên giữ bản chụp cũ thay vì nhận bản mới không.
+///
+/// Một lần hỏi hụt không có nghĩa là Tailscale đã tắt — trên macOS nó hay lỡ
+/// nhịp. Nhảy ngay sang màu đỏ thì người dùng mất luôn địa chỉ 100.x đang đọc
+/// dở và danh sách máy, rồi vài giây sau nó lại hiện về: khung nhấp nháy mà
+/// chẳng có gì hỏng thật.
+fn giu_ban_cu(cu: &Status, moi: &Status, hong: &AtomicU32) -> bool {
+    let dang_chay = matches!(cu.state, Some(State::Running));
+    let van_chay = matches!(moi.state, Some(State::Running));
+    if van_chay || !dang_chay {
+        hong.store(0, Ordering::Relaxed);
+        return false;
+    }
+    hong.fetch_add(1, Ordering::Relaxed) + 1 < HONG_TOI_DA
+}
+
 /// Máy đang bật lên trước, rồi tới thứ tự tên: danh sách này để bấm chọn, mà
 /// máy đang tắt thì bấm cũng không nối được.
 fn sort_peers(peers: &mut [Peer]) {
@@ -599,6 +668,8 @@ pub struct Watcher {
     message: Arc<Mutex<Option<String>>>,
     /// Lần cuối bắt đầu đi hỏi, để `tick` biết đã tới lượt chưa.
     last_poll: Mutex<Instant>,
+    /// Số lần hỏi hụt liên tiếp, đếm từ lúc trạng thái còn đang tốt.
+    hong: Arc<AtomicU32>,
     /// Đánh thức giao diện khi luồng nền hỏi xong. Thiếu nó thì kết quả nằm im
     /// tới lần người dùng động vào cửa sổ — đăng nhập xong mà màn hình vẫn ghi
     /// "chưa đăng nhập" cho tới khi rê chuột.
@@ -618,6 +689,7 @@ impl Watcher {
             busy: Arc::new(AtomicBool::new(false)),
             message: Arc::new(Mutex::new(None)),
             last_poll: Mutex::new(Instant::now()),
+            hong: Arc::new(AtomicU32::new(0)),
             repaint: Arc::new(std::sync::OnceLock::new()),
         };
         watcher.refresh();
@@ -675,6 +747,7 @@ impl Watcher {
             return;
         }
         let slot = self.status.clone();
+        let hong = self.hong.clone();
         let busy = self.busy.clone();
         let message = self.message.clone();
         let repaint = self.repaint.clone();
@@ -683,7 +756,12 @@ impl Watcher {
             .spawn(move || {
                 let note = job();
                 *message.lock().expect("khoá lời nhắn") = note;
-                *slot.lock().expect("khoá trạng thái tailscale") = status();
+                let moi = status();
+                let mut cho = slot.lock().expect("khoá trạng thái tailscale");
+                if !giu_ban_cu(&cho, &moi, &hong) {
+                    *cho = moi;
+                }
+                drop(cho);
                 busy.store(false, Ordering::Relaxed);
                 if let Some(ctx) = repaint.get() {
                     ctx.request_repaint();
@@ -730,6 +808,45 @@ mod tests {
 
     fn node(json: &str) -> RawNode {
         serde_json::from_str(json).expect("đọc được node")
+    }
+
+    #[test]
+    fn cau_than_tieng_anh_khong_thanh_loi_json() {
+        // Nguyên văn bản Tailscale cài từ App Store in ra stdout, mã thoát 0.
+        let text = "The Tailscale GUI failed to start: The operation couldn\u{2019}t be \
+                    completed. (Tailscale.CLIError error 3.)\n\n";
+        let Err(loi) = doc_trang_thai(text) else {
+            panic!("câu than tiếng Anh không phải JSON");
+        };
+        assert!(loi.contains("mở ứng dụng Tailscale"), "{loi}");
+        assert!(!loi.contains("JSON"), "{loi}");
+    }
+
+    #[test]
+    fn bo_qua_chu_thua_dung_truoc_json() {
+        let raw = doc_trang_thai("Warning: something\n{\"BackendState\":\"Running\"}")
+            .expect("vẫn đọc được JSON");
+        assert_eq!(raw.backend_state.as_deref(), Some("Running"));
+    }
+
+    #[test]
+    fn hong_mot_hai_lan_thi_van_giu_ban_cu() {
+        let chay = Status {
+            state: Some(State::Running),
+            ..Status::default()
+        };
+        let hong_roi = Status {
+            state: Some(State::Broken("lỡ nhịp".into())),
+            ..Status::default()
+        };
+        let dem = AtomicU32::new(0);
+        assert!(giu_ban_cu(&chay, &hong_roi, &dem));
+        assert!(giu_ban_cu(&chay, &hong_roi, &dem));
+        // Lần thứ ba thì chịu: hỏng thật rồi.
+        assert!(!giu_ban_cu(&chay, &hong_roi, &dem));
+        // Hỏi lại được thì quên hết, lần hụt sau lại được tha.
+        assert!(!giu_ban_cu(&chay, &chay, &dem));
+        assert!(giu_ban_cu(&chay, &hong_roi, &dem));
     }
 
     #[test]
