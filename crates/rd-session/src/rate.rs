@@ -53,6 +53,14 @@ const LOSS_LOW: f32 = 0.005;
 const RTT_INFLATION: f32 = 1.5;
 const RTT_MARGIN: Duration = Duration::from_millis(30);
 
+/// Trần khi phiên đi vòng qua máy trung chuyển DERP của Tailscale.
+///
+/// DERP là hạ tầng dùng chung Tailscale cho không, băng thông chia cho mọi
+/// người và đường đi thì vòng qua một máy chủ ở xa. Bơm 30 Mbps vào đó vừa
+/// không tới nơi vừa chiếm phần của người khác; mức này đủ cho một màn hình
+/// làm việc mà không làm hàng đợi phình.
+pub const DERP_KBPS: u32 = 8_000;
+
 /// Đổi ít hơn ngần này thì không báo ra: dựng lại tham số bộ mã hoá cũng có giá
 /// của nó, mà 3% bitrate thì mắt không thấy.
 const CHANGE_THRESHOLD: f32 = 0.05;
@@ -70,6 +78,10 @@ pub struct LinkSample {
 #[derive(Debug)]
 pub struct RateController {
     ceiling: u32,
+    /// Trần phụ do đường đi áp xuống, tách khỏi `ceiling` của người dùng: kéo
+    /// thanh bitrate lên không được phép xoá mất giới hạn của DERP, mà chuyển
+    /// sang nối thẳng thì cũng không được phép mất mức người dùng đã đặt.
+    relay_ceiling: Option<u32>,
     current: u32,
     rtt_min: Option<Duration>,
     last: Option<LinkSample>,
@@ -80,6 +92,7 @@ impl RateController {
         let ceiling = ceiling_kbps.max(MIN_KBPS);
         Self {
             ceiling,
+            relay_ceiling: None,
             current: START_KBPS.min(ceiling).max(MIN_KBPS),
             rtt_min: None,
             last: None,
@@ -94,11 +107,32 @@ impl RateController {
         self.ceiling
     }
 
+    /// Trần thật đang có hiệu lực: mức người dùng đặt, kẹp thêm bởi đường đi.
+    fn tran(&self) -> u32 {
+        match self.relay_ceiling {
+            Some(relay) => self.ceiling.min(relay).max(MIN_KBPS),
+            None => self.ceiling,
+        }
+    }
+
+    /// Đặt hoặc gỡ trần của đường vòng. Trả về mức mới nếu phải hạ ngay.
+    pub fn set_relay_ceiling(&mut self, kbps: Option<u32>) -> Option<u32> {
+        if self.relay_ceiling == kbps {
+            return None;
+        }
+        self.relay_ceiling = kbps;
+        let clamped = self.current.min(self.tran());
+        (clamped != self.current).then(|| {
+            self.current = clamped;
+            clamped
+        })
+    }
+
     /// Đổi trần (người dùng kéo thanh bitrate). Trả về mức mới nếu việc này ép
     /// mức hiện tại phải đổi theo.
     pub fn set_ceiling(&mut self, kbps: u32) -> Option<u32> {
         self.ceiling = kbps.max(MIN_KBPS);
-        let clamped = self.current.min(self.ceiling);
+        let clamped = self.current.min(self.tran());
         (clamped != self.current).then(|| {
             self.current = clamped;
             clamped
@@ -136,7 +170,7 @@ impl RateController {
             return None;
         };
 
-        let next = (target as u32).clamp(MIN_KBPS, self.ceiling);
+        let next = (target as u32).clamp(MIN_KBPS, self.tran());
         self.commit(next)
     }
 
@@ -155,7 +189,7 @@ impl RateController {
         let change = (next as f32 - self.current as f32).abs() / self.current as f32;
         // Chạm sàn hoặc trần thì báo dù bước nhỏ: đó là hai mốc mà phía gọi cần
         // biết mình đã tới, không phải một bước dò giữa đường.
-        if change < CHANGE_THRESHOLD && next != MIN_KBPS && next != self.ceiling {
+        if change < CHANGE_THRESHOLD && next != MIN_KBPS && next != self.tran() {
             return None;
         }
         self.current = next;
@@ -284,6 +318,32 @@ mod tests {
             None
         );
         assert_eq!(rate.current(), START_KBPS);
+    }
+
+    /// Đường vòng qua DERP thì kẹp xuống ngay, dù người dùng đặt trần cao.
+    #[test]
+    fn di_vong_derp_thi_ha_tran_ngay() {
+        let mut rate = RateController::new(30_000);
+        for tick in 1..=10 {
+            rate.update(clean(tick));
+        }
+        assert_eq!(rate.current(), 30_000);
+        assert_eq!(rate.set_relay_ceiling(Some(DERP_KBPS)), Some(DERP_KBPS));
+        // Đường vẫn sạch nhưng không được leo quá trần của DERP nữa.
+        for tick in 11..=20 {
+            rate.update(clean(tick));
+        }
+        assert_eq!(rate.current(), DERP_KBPS);
+        // Kéo thanh bitrate lúc đang đi vòng cũng không phá được trần ấy.
+        rate.set_ceiling(50_000);
+        rate.update(clean(21));
+        assert_eq!(rate.current(), DERP_KBPS);
+        // Nối thẳng được rồi thì trả lại mức người dùng đặt.
+        assert_eq!(rate.set_relay_ceiling(None), None);
+        for tick in 22..=40 {
+            rate.update(clean(tick));
+        }
+        assert_eq!(rate.current(), 50_000);
     }
 
     #[test]

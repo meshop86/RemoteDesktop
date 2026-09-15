@@ -50,15 +50,29 @@ pub type Result<T> = std::result::Result<T, InputError>;
 pub struct ScreenGeometry {
     pub width: f32,
     pub height: f32,
+    /// Góc trên trái của màn hình đang chia sẻ, trong hệ toạ độ chuột chung của
+    /// cả máy. Màn hình chính là (0, 0); màn hình phụ thì khác.
+    pub origin_x: f32,
+    pub origin_y: f32,
 }
 
 impl ScreenGeometry {
     /// Ép về trong màn hình rồi đổi sang pixel. Viewer có thể gửi toạ độ hơi
     /// lố ra ngoài khi chuột đi ra mép cửa sổ, không nên để nó thành toạ độ âm.
     pub fn to_pixels(self, x: f32, y: f32) -> (f64, f64) {
-        let x = x.clamp(0.0, 1.0) * (self.width - 1.0).max(0.0);
-        let y = y.clamp(0.0, 1.0) * (self.height - 1.0).max(0.0);
+        let x = self.origin_x + x.clamp(0.0, 1.0) * (self.width - 1.0).max(0.0);
+        let y = self.origin_y + y.clamp(0.0, 1.0) * (self.height - 1.0).max(0.0);
         (x as f64, y as f64)
+    }
+
+    /// Màn hình chính, hoặc lúc chưa biết gì hơn.
+    pub fn new(width: f32, height: f32) -> Self {
+        Self {
+            width,
+            height,
+            origin_x: 0.0,
+            origin_y: 0.0,
+        }
     }
 }
 
@@ -232,13 +246,23 @@ mod tests {
 
     #[test]
     fn toa_do_chuan_hoa_ra_pixel() {
-        let geometry = ScreenGeometry {
-            width: 1920.0,
-            height: 1080.0,
-        };
+        let geometry = ScreenGeometry::new(1920.0, 1080.0);
         assert_eq!(geometry.to_pixels(0.0, 0.0), (0.0, 0.0));
         assert_eq!(geometry.to_pixels(1.0, 1.0), (1919.0, 1079.0));
         // Chuột đi lố ra ngoài cửa sổ viewer không được thành toạ độ âm.
         assert_eq!(geometry.to_pixels(-0.5, 2.0), (0.0, 1079.0));
+    }
+
+    #[test]
+    fn man_hinh_phu_duoc_cong_them_goc_toa_do() {
+        // Màn hình phụ 1280x720 đặt bên phải màn chính 1920 rộng.
+        let geometry = ScreenGeometry {
+            width: 1280.0,
+            height: 720.0,
+            origin_x: 1920.0,
+            origin_y: 0.0,
+        };
+        assert_eq!(geometry.to_pixels(0.0, 0.0), (1920.0, 0.0));
+        assert_eq!(geometry.to_pixels(1.0, 1.0), (3199.0, 719.0));
     }
 }

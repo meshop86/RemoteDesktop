@@ -15,6 +15,14 @@
 //!    NV12; `with_plane_slice` của wgpu-hal sinh ra đúng để bọc từng plane của
 //!    một tài nguyên đa plane thành một texture đơn plane.
 //!
+//! **Đường dự phòng.** Mắt xích D3D11 → D3D12 chỉ có khi wgpu chạy trên
+//! Direct3D 12. Máy nào rơi xuống Vulkan hoặc OpenGL — driver cũ, phiên Remote
+//! Desktop, hoặc lần chạy trước DirectX 12 đã kéo tiến trình chết nên bị tránh
+//! — thì không mở được texture chia sẻ. Trước đây chỗ đó ném lỗi mỗi frame và
+//! viewer đen kịt suốt phiên. Nay có đường thứ hai: chép frame xuống RAM rồi
+//! nạp lên bằng wgpu. Tốn thêm một vòng RAM (1080p khoảng 3 MB mỗi frame) nên
+//! chậm hơn, nhưng thấy hình vẫn hơn nhìn màn hình đen.
+//!
 //! **Về cảnh báo aliasing của `with_plane_slice`:** hai texture bọc chung một
 //! `ID3D12Resource` sẽ làm bộ theo dõi trạng thái của wgpu hiểu nhầm nếu chúng
 //! *đổi* trạng thái khác nhau. Ở đây cả hai được khai báo `RESOURCE` ngay từ
@@ -24,9 +32,10 @@
 use rd_codec::mediafoundation::DecodedFrame;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_SHADER_RESOURCE, D3D11_FENCE_FLAG_NONE, D3D11_RESOURCE_MISC_SHARED,
-    D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device,
-    ID3D11Device5, ID3D11DeviceContext4, ID3D11Fence, ID3D11Texture2D,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ, D3D11_FENCE_FLAG_NONE, D3D11_MAP_READ,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_RESOURCE_MISC_SHARED, D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, ID3D11Device, ID3D11Device5,
+    ID3D11DeviceContext, ID3D11DeviceContext4, ID3D11Fence, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Direct3D12::{ID3D12Device, ID3D12Resource};
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
@@ -59,7 +68,7 @@ struct Slot {
     planes: [wgpu::Texture; 2],
 }
 
-pub struct Importer {
+struct Shared {
     context: ID3D11DeviceContext4,
     fence: ID3D11Fence,
     /// Giá trị fence của lần chép gần nhất. Tăng dần, không bao giờ lặp lại.
@@ -76,16 +85,16 @@ pub struct Importer {
 // An toàn: mọi thao tác chạm tới device context đều đi qua `&mut self`, nên
 // không có hai luồng nào dùng nó cùng lúc. Bản thân device D3D11 là
 // free-threaded.
-unsafe impl Send for Importer {}
-unsafe impl Sync for Importer {}
+unsafe impl Send for Shared {}
+unsafe impl Sync for Shared {}
 
-impl Importer {
+impl Shared {
     /// Dựng vòng texture theo đúng kích thước của frame đầu tiên.
     ///
     /// Device D3D11 lấy ngay từ texture của frame chứ không nhận từ ngoài: mọi
     /// texture chia sẻ phải nằm cùng device với bộ giải mã, và đây là cách chắc
     /// chắn nhất để không lấy nhầm device khác.
-    pub fn new(device: &wgpu::Device, frame: &DecodedFrame) -> anyhow::Result<Self> {
+    fn new(device: &wgpu::Device, frame: &DecodedFrame) -> anyhow::Result<Self> {
         let (width, height) = (frame.width, frame.height);
         if width % 2 != 0 || height % 2 != 0 {
             anyhow::bail!("NV12 cần kích thước chẵn, nhận {width}x{height}");
@@ -128,7 +137,7 @@ impl Importer {
         })
     }
 
-    pub fn matches(&self, frame: &DecodedFrame) -> bool {
+    fn matches(&self, frame: &DecodedFrame) -> bool {
         self.width == frame.width && self.height == frame.height
     }
 
@@ -138,7 +147,7 @@ impl Importer {
     /// đợi của D3D12, hai hàng đợi khác nhau nên không có thứ tự nào được bảo
     /// đảm giữa chúng. Không chờ thì thỉnh thoảng viewer vẽ nửa frame cũ nửa
     /// frame mới, và lỗi kiểu đó gần như không tài nào tái hiện được.
-    pub fn stage(&mut self, frame: &DecodedFrame) -> anyhow::Result<usize> {
+    fn stage(&mut self, frame: &DecodedFrame) -> anyhow::Result<usize> {
         if !self.matches(frame) {
             anyhow::bail!(
                 "frame {}x{} không khớp vòng texture {}x{}",
@@ -171,7 +180,8 @@ impl Importer {
             // `Flush` mới thực sự đẩy lệnh xuống driver; thiếu nó thì fence có
             // thể nằm im trong bộ đệm lệnh và ta chờ vô hạn.
             self.context.Flush();
-            self.fence.SetEventOnCompletion(self.fence_value, self.done)?;
+            self.fence
+                .SetEventOnCompletion(self.fence_value, self.done)?;
             // Chờ hỏng thì frame chưa chắc đã chép xong; vẽ tiếp là vẽ rác nên
             // thà bỏ frame còn hơn.
             if WaitForSingleObject(self.done, INFINITE) != WAIT_OBJECT_0 {
@@ -182,12 +192,12 @@ impl Importer {
         Ok(index)
     }
 
-    pub fn planes(&self, index: usize) -> &[wgpu::Texture; 2] {
+    fn planes(&self, index: usize) -> &[wgpu::Texture; 2] {
         &self.ring[index].planes
     }
 }
 
-impl Drop for Importer {
+impl Drop for Shared {
     fn drop(&mut self) {
         // Handle sự kiện là tài nguyên kernel, không phải đối tượng COM nên
         // không có ai đếm tham chiếu hộ.
@@ -319,5 +329,269 @@ fn plane(
             // cho wgpu quyền coi nội dung là rác và vứt đi.
             wgpu::TextureUses::RESOURCE,
         )
+    }
+}
+
+/// Đường dự phòng: chép frame xuống RAM rồi nạp lên GPU bằng chính wgpu.
+///
+/// Dùng khi không bắc được cầu D3D11 → D3D12. Chậm hơn đường chia sẻ vì pixel
+/// phải đi hết một vòng qua RAM, nhưng không phụ thuộc backend nào của wgpu và
+/// không cần texture chia sẻ.
+struct Cpu {
+    context: ID3D11DeviceContext,
+    /// Texture trung gian mà CPU đọc được. Bộ giải mã trả texture nằm trong
+    /// VRAM và không cho CPU chạm vào, nên phải chép qua đây một nhịp.
+    staging: ID3D11Texture2D,
+    planes: [wgpu::Texture; 2],
+    /// Đệm dùng lại giữa các frame — cấp mới 3 MB mỗi frame là việc thừa.
+    luma: Vec<u8>,
+    chroma: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+// An toàn: cùng lý do như `Shared` — mọi lời gọi đều đi qua `&mut self`.
+unsafe impl Send for Cpu {}
+unsafe impl Sync for Cpu {}
+
+impl Cpu {
+    fn new(device: &wgpu::Device, frame: &DecodedFrame) -> anyhow::Result<Self> {
+        let (width, height) = (frame.width, frame.height);
+        if width % 2 != 0 || height % 2 != 0 {
+            anyhow::bail!("NV12 cần kích thước chẵn, nhận {width}x{height}");
+        }
+
+        let d3d11 = unsafe { frame.texture().GetDevice() }?;
+        let context = unsafe { d3d11.GetImmediateContext() }?;
+
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut staging = None;
+        unsafe { d3d11.CreateTexture2D(&desc, None, Some(&mut staging)) }?;
+        let staging = staging.expect("CreateTexture2D thành công thì phải có texture");
+
+        let luma = plane_texture(
+            device,
+            wgpu::TextureFormat::R8Unorm,
+            width,
+            height,
+            "video plane Y (CPU)",
+        );
+        let chroma = plane_texture(
+            device,
+            wgpu::TextureFormat::Rg8Unorm,
+            width / 2,
+            height / 2,
+            "video plane CbCr (CPU)",
+        );
+
+        Ok(Self {
+            context,
+            staging,
+            planes: [luma, chroma],
+            luma: vec![0; (width * height) as usize],
+            chroma: vec![0; (width * height / 2) as usize],
+            width,
+            height,
+        })
+    }
+
+    fn matches(&self, frame: &DecodedFrame) -> bool {
+        self.width == frame.width && self.height == frame.height
+    }
+
+    /// Chép frame xuống RAM rồi đẩy lên hai texture wgpu. Luôn trả về ô 0: chỉ
+    /// có một cặp texture, và wgpu tự lo thứ tự giữa lần ghi này với lần vẽ
+    /// trước.
+    fn stage(&mut self, queue: &wgpu::Queue, frame: &DecodedFrame) -> anyhow::Result<usize> {
+        let (width, height) = (self.width as usize, self.height as usize);
+
+        unsafe {
+            self.context.CopySubresourceRegion(
+                &self.staging,
+                0,
+                0,
+                0,
+                0,
+                frame.texture(),
+                frame.subresource(),
+                None,
+            );
+
+            // `Map` trên texture staging chờ sẵn cho lệnh chép ở trên xong —
+            // cùng một device context nên không cần fence như đường chia sẻ.
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+
+            let pitch = mapped.RowPitch as usize;
+            if mapped.pData.is_null() || pitch < width {
+                self.context.Unmap(&self.staging, 0);
+                anyhow::bail!("khoá được frame nhưng bố cục lạ: pitch {pitch}");
+            }
+            let src = mapped.pData as *const u8;
+
+            // Mỗi hàng dài `pitch` byte trong khi ảnh chỉ rộng `width`, nên
+            // phải chép từng hàng chứ không bê nguyên khối. Plane CbCr nằm
+            // ngay sau plane Y trong cùng một vùng nhớ, cùng độ dài hàng.
+            for row in 0..height {
+                let from = src.add(row * pitch);
+                let to = self.luma.as_mut_ptr().add(row * width);
+                std::ptr::copy_nonoverlapping(from, to, width);
+            }
+            let chroma_start = src.add(pitch * height);
+            for row in 0..height / 2 {
+                let from = chroma_start.add(row * pitch);
+                let to = self.chroma.as_mut_ptr().add(row * width);
+                std::ptr::copy_nonoverlapping(from, to, width);
+            }
+
+            self.context.Unmap(&self.staging, 0);
+        }
+
+        write_plane(
+            queue,
+            &self.planes[0],
+            &self.luma,
+            self.width,
+            self.width,
+            self.height,
+        );
+        write_plane(
+            queue,
+            &self.planes[1],
+            &self.chroma,
+            self.width,
+            self.width / 2,
+            self.height / 2,
+        );
+        Ok(0)
+    }
+
+    fn planes(&self, _index: usize) -> &[wgpu::Texture; 2] {
+        &self.planes
+    }
+}
+
+/// Texture wgpu rỗng để nạp dữ liệu từ RAM vào.
+fn plane_texture(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    label: &str,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+fn write_plane(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    data: &[u8],
+    bytes_per_row: u32,
+    width: u32,
+    height: u32,
+) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
+/// Cầu nối giữa frame đã giải mã và wgpu, tự chọn đường đi được.
+pub struct Importer {
+    duong: Duong,
+}
+
+enum Duong {
+    /// Chia sẻ thẳng texture giữa D3D11 và D3D12 — không có lần chép nào ra
+    /// khỏi VRAM.
+    Chia(Shared),
+    /// Đi vòng qua RAM. Chậm hơn nhưng chạy trên mọi backend.
+    Ram(Cpu),
+}
+
+impl Importer {
+    pub fn new(device: &wgpu::Device, frame: &DecodedFrame) -> anyhow::Result<Self> {
+        match Shared::new(device, frame) {
+            Ok(shared) => {
+                tracing::info!("nạp frame bằng texture chia sẻ D3D11 → D3D12");
+                Ok(Self {
+                    duong: Duong::Chia(shared),
+                })
+            }
+            Err(err) => {
+                // Không phải lỗi chết người: chỉ là máy này không bắc được cầu,
+                // đi đường vòng qua RAM vẫn có hình.
+                tracing::warn!(%err, "không chia sẻ được texture, chuyển sang chép qua RAM");
+                let cpu = Cpu::new(device, frame)?;
+                tracing::info!("nạp frame bằng đường chép qua RAM");
+                Ok(Self {
+                    duong: Duong::Ram(cpu),
+                })
+            }
+        }
+    }
+
+    pub fn matches(&self, frame: &DecodedFrame) -> bool {
+        match &self.duong {
+            Duong::Chia(shared) => shared.matches(frame),
+            Duong::Ram(cpu) => cpu.matches(frame),
+        }
+    }
+
+    pub fn stage(&mut self, queue: &wgpu::Queue, frame: &DecodedFrame) -> anyhow::Result<usize> {
+        match &mut self.duong {
+            Duong::Chia(shared) => shared.stage(frame),
+            Duong::Ram(cpu) => cpu.stage(queue, frame),
+        }
+    }
+
+    pub fn planes(&self, index: usize) -> &[wgpu::Texture; 2] {
+        match &self.duong {
+            Duong::Chia(shared) => shared.planes(index),
+            Duong::Ram(cpu) => cpu.planes(index),
+        }
     }
 }

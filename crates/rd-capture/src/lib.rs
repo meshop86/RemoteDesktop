@@ -30,7 +30,9 @@ pub use windows::{D3dSurface as Surface, WgcScreenCapturer as PlatformCapturer};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
-    #[error("hệ điều hành từ chối quyền quay màn hình — cấp quyền trong System Settings > Privacy & Security > Screen Recording rồi chạy lại")]
+    #[error(
+        "hệ điều hành từ chối quyền quay màn hình — cấp quyền trong System Settings > Privacy & Security > Screen Recording rồi chạy lại"
+    )]
     PermissionDenied,
     #[error("không tìm thấy màn hình có id {0}")]
     DisplayNotFound(u32),
@@ -56,6 +58,17 @@ pub struct DisplayInfo {
     pub scale: f32,
     pub refresh_hz: u32,
     pub is_primary: bool,
+    /// Góc trên trái của màn hình trong *hệ toạ độ chuột* của hệ điều hành.
+    ///
+    /// Không cùng đơn vị với `width`/`height`: macOS tính chuột theo point còn
+    /// đây là pixel. Màn hình phụ nằm bên phải thì `origin_x` bằng bề ngang của
+    /// màn hình chính — thiếu số này thì bơm chuột vào màn hình phụ sẽ rơi hết
+    /// sang màn hình chính.
+    pub origin_x: i32,
+    pub origin_y: i32,
+    /// Bề ngang/cao trong cùng hệ toạ độ với `origin_*`.
+    pub logical_width: u32,
+    pub logical_height: u32,
 }
 
 /// Định dạng pixel mà capture trả về.

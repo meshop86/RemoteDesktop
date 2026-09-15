@@ -5,7 +5,8 @@ use std::{marker::PhantomData, net::SocketAddr, time::Duration};
 use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendStream};
 use rd_protocol::{
-    AssembledFrame, FrameAssembler, assembler::AssemblerStats, control::Codec, video::fragment_frame,
+    AssembledFrame, FrameAssembler, MAX_VIDEO_PAYLOAD, VIDEO_HEADER_LEN, assembler::AssemblerStats,
+    control::Codec, video::fragment_frame,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -14,6 +15,51 @@ use crate::TransportError;
 /// Trần kích thước một control message. Chat và metadata file đều rất nhỏ;
 /// giới hạn này chỉ để chặn đầu kia gửi độ dài rác làm ta cấp phát khổng lồ.
 pub const MAX_CONTROL_MESSAGE: usize = 1024 * 1024;
+
+/// Nhãn của chuỗi ràng buộc kênh. Đổi nhãn là đổi chuỗi, nên hai đầu phải
+/// giống hệt nhau — sửa ở đây thì phải nâng `PROTOCOL_VERSION`.
+const CHANNEL_BINDING_LABEL: &[u8] = b"rd-auth-v1";
+
+/// Lời chào mở đầu kênh control: bốn chữ nhận dạng rồi số hiệu giao thức.
+///
+/// Có nó thì hai bản lệch nhau nói được ngay là lệch bản. Không có nó, đầu kia
+/// cứ thế đọc byte lạ thành message rồi báo "lỗi giải mã" — chẳng ai đoán ra.
+/// Bản cũ chưa biết lời chào sẽ đọc bốn byte đầu thành độ dài hơn một tỉ, nên
+/// nó kêu "message quá lớn" rồi dừng, chứ không đứng chờ mãi.
+const CONTROL_MAGIC: [u8; 4] = *b"RDCT";
+const CONTROL_PREAMBLE_LEN: usize = CONTROL_MAGIC.len() + 2;
+
+fn tao_loi_chao() -> [u8; CONTROL_PREAMBLE_LEN] {
+    let mut chao = [0u8; CONTROL_PREAMBLE_LEN];
+    chao[..CONTROL_MAGIC.len()].copy_from_slice(&CONTROL_MAGIC);
+    chao[CONTROL_MAGIC.len()..].copy_from_slice(&rd_protocol::PROTOCOL_VERSION.to_le_bytes());
+    chao
+}
+
+fn kiem_loi_chao(chao: &[u8; CONTROL_PREAMBLE_LEN]) -> Result<(), TransportError> {
+    if chao[..CONTROL_MAGIC.len()] != CONTROL_MAGIC {
+        return Err(TransportError::NotOurProtocol);
+    }
+    let dau_kia = u16::from_le_bytes([chao[4], chao[5]]);
+    if dau_kia != rd_protocol::PROTOCOL_VERSION {
+        return Err(TransportError::VersionMismatch {
+            cua_ta: rd_protocol::PROTOCOL_VERSION,
+            dau_kia,
+        });
+    }
+    Ok(())
+}
+
+async fn gui_loi_chao(send: &mut SendStream) -> Result<(), TransportError> {
+    send.write_all(&tao_loi_chao()).await?;
+    Ok(())
+}
+
+async fn doc_loi_chao(recv: &mut RecvStream) -> Result<(), TransportError> {
+    let mut chao = [0u8; CONTROL_PREAMBLE_LEN];
+    recv.read_exact(&mut chao).await?;
+    kiem_loi_chao(&chao)
+}
 
 #[derive(Clone)]
 pub struct Session {
@@ -33,6 +79,35 @@ impl Session {
         self.conn.remote_address()
     }
 
+    /// Ba mươi hai byte chỉ đúng kết nối TLS này mới có.
+    ///
+    /// Hai đầu của *cùng một* kết nối tính ra cùng một chuỗi, hai kết nối khác
+    /// nhau thì không bao giờ trùng (RFC 5705). Dùng nó trộn vào mật khẩu là
+    /// kẻ đứng giữa có bắt được lời chào cũng vô dụng: hắn đang ngồi trên hai
+    /// kết nối khác nhau, mỗi bên một chuỗi, nên không phát lại sang bên kia
+    /// được.
+    pub fn channel_binding(&self) -> Result<[u8; 32], TransportError> {
+        let mut out = [0u8; 32];
+        self.conn
+            .export_keying_material(&mut out, CHANNEL_BINDING_LABEL, b"")
+            .map_err(|_| TransportError::Tls("không lấy được ràng buộc kênh".into()))?;
+        Ok(out)
+    }
+
+    /// Vân tay chứng chỉ mà đầu kia vừa dùng để bắt tay.
+    ///
+    /// Viewer lưu con số này lại sau lần nối đầu tiên rồi ghim từ lần sau
+    /// (xem [`crate::client_config_for`]). Phía host luôn trả `None` vì viewer
+    /// không xuất trình chứng chỉ nào.
+    pub fn peer_fingerprint(&self) -> Option<[u8; 32]> {
+        let certs = self
+            .conn
+            .peer_identity()?
+            .downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
+            .ok()?;
+        certs.first().map(|cert| crate::tls::fingerprint_of(cert))
+    }
+
     pub fn close(&self, reason: &str) {
         self.conn.close(0u32.into(), reason.as_bytes());
     }
@@ -45,7 +120,11 @@ impl Session {
         Tx: Serialize,
         Rx: DeserializeOwned,
     {
-        let (send, recv) = self.conn.open_bi().await?;
+        let (mut send, mut recv) = self.conn.open_bi().await?;
+        // Bên mở chào trước: `open_bi` chưa tạo stream ở đầu kia cho tới lần ghi
+        // đầu tiên, nên chào xong mới có cái để đọc.
+        gui_loi_chao(&mut send).await?;
+        doc_loi_chao(&mut recv).await?;
         Ok((ControlSender::new(send), ControlReceiver::new(recv)))
     }
 
@@ -57,7 +136,9 @@ impl Session {
         Tx: Serialize,
         Rx: DeserializeOwned,
     {
-        let (send, recv) = self.conn.accept_bi().await?;
+        let (mut send, mut recv) = self.conn.accept_bi().await?;
+        doc_loi_chao(&mut recv).await?;
+        gui_loi_chao(&mut send).await?;
         Ok((ControlSender::new(send), ControlReceiver::new(recv)))
     }
 
@@ -147,7 +228,35 @@ impl VideoSender {
         let frame_id = self.frame_id;
         self.frame_id = self.frame_id.wrapping_add(1);
 
-        let packets = fragment_frame(encoded, frame_id, self.monitor, codec, keyframe, capture_us);
+        // Hỏi lại mỗi frame: quinn cập nhật con số này khi đường truyền đổi.
+        let max_payload = self
+            .session
+            .conn
+            .max_datagram_size()
+            .map(|size| size.saturating_sub(VIDEO_HEADER_LEN))
+            .filter(|payload| *payload > 0)
+            .unwrap_or(MAX_VIDEO_PAYLOAD);
+        // Một frame chỉ dùng được khi *đủ* mảnh. Bắn nửa frame vào một hàng
+        // đợi sắp đầy là vừa phí băng thông vừa chiếm chỗ của frame kế tiếp —
+        // frame đó mới là frame viewer thật sự cần. Không đủ chỗ thì bỏ cả
+        // frame ngay từ đầu, coi như frame này chưa từng tồn tại.
+        let fragments = encoded.len().div_ceil(max_payload).max(1);
+        let needed = encoded.len() + fragments * VIDEO_HEADER_LEN;
+        if self.session.conn.datagram_send_buffer_space() < needed {
+            self.dropped_frames += 1;
+            tracing::debug!(frame_id, needed, "bỏ frame vì hàng đợi datagram sắp đầy");
+            return Ok(0);
+        }
+
+        let packets = fragment_frame(
+            encoded,
+            frame_id,
+            self.monitor,
+            codec,
+            keyframe,
+            capture_us,
+            max_payload,
+        );
         let total = packets.len();
         for packet in packets {
             match self.session.conn.send_datagram(packet) {
@@ -260,5 +369,43 @@ impl<T: DeserializeOwned> ControlReceiver<T> {
         self.buf.resize(len, 0);
         self.stream.read_exact(&mut self.buf).await?;
         Ok(postcard::from_bytes(&self.buf)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loi_chao_cua_chinh_minh_thi_hop_le() {
+        assert!(kiem_loi_chao(&tao_loi_chao()).is_ok());
+    }
+
+    #[test]
+    fn lech_ban_thi_noi_ro_la_lech_ban() {
+        let mut chao = tao_loi_chao();
+        chao[4] = chao[4].wrapping_add(1);
+        let Err(TransportError::VersionMismatch { dau_kia, .. }) = kiem_loi_chao(&chao) else {
+            panic!("phải nhận ra hai bên lệch số hiệu giao thức");
+        };
+        assert_ne!(dau_kia, rd_protocol::PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn byte_la_thi_khong_nhan_la_nguoi_nha() {
+        let chao = [0u8; CONTROL_PREAMBLE_LEN];
+        assert!(matches!(
+            kiem_loi_chao(&chao),
+            Err(TransportError::NotOurProtocol)
+        ));
+    }
+
+    /// Bản cũ chưa biết lời chào sẽ đọc bốn byte đầu thành độ dài message.
+    /// Nó phải thấy con số vượt trần để kêu lên ngay, thay vì ngồi đợi.
+    #[test]
+    fn ban_cu_doc_loi_chao_thanh_do_dai_qua_tran() {
+        let chao = tao_loi_chao();
+        let do_dai = u32::from_le_bytes([chao[0], chao[1], chao[2], chao[3]]) as usize;
+        assert!(do_dai > MAX_CONTROL_MESSAGE);
     }
 }

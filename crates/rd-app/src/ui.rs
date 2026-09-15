@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use eframe::egui;
 
-#[cfg(target_os = "macos")]
-use rd_codec::videotoolbox::DecodedFrame;
 #[cfg(target_os = "windows")]
 use rd_codec::mediafoundation::DecodedFrame;
+#[cfg(target_os = "macos")]
+use rd_codec::videotoolbox::DecodedFrame;
 
 use rd_viewer::metrics::Summary;
 use rd_viewer::pipeline::PipelineInfo;
@@ -141,12 +141,7 @@ pub fn draw_hud(ui: &mut egui::Ui, data: &HudData<'_>) {
                 ui.separator();
             }
             for (text, color) in &data.lines {
-                ui.label(
-                    egui::RichText::new(text)
-                        .monospace()
-                        .small()
-                        .color(*color),
-                );
+                ui.label(egui::RichText::new(text).monospace().small().color(*color));
             }
         });
 }
@@ -162,6 +157,21 @@ pub fn hud_at(ui: &mut egui::Ui, outer: egui::Rect, data: &HudData<'_>) {
     );
 }
 
+/// Cắt bớt chuỗi quá dài, giữ đầu và đuôi để còn nhận ra đuôi file.
+///
+/// Đếm theo ký tự chứ không theo byte: tên file tiếng Việt có dấu, cắt giữa
+/// một ký tự nhiều byte là vỡ chữ.
+pub fn rut_gon(text: &str, toi_da: usize) -> String {
+    let chu: Vec<char> = text.chars().collect();
+    if chu.len() <= toi_da {
+        return text.to_string();
+    }
+    let dau = toi_da.saturating_sub(9);
+    let duoi: String = chu[chu.len() - 6..].iter().collect();
+    let dau: String = chu[..dau].iter().collect();
+    format!("{dau}…{duoi}")
+}
+
 /// Đổi số byte sang chuỗi người đọc được.
 pub fn bytes(value: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
@@ -175,5 +185,24 @@ pub fn bytes(value: u64) -> String {
         format!("{value:.0} {}", UNITS[unit])
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rut_gon;
+
+    #[test]
+    fn ten_ngan_thi_giu_nguyen() {
+        assert_eq!(rut_gon("ảnh.png", 34), "ảnh.png");
+    }
+
+    #[test]
+    fn ten_dai_thi_cat_giua_va_giu_duoi_file() {
+        let goc = "bản-ghi-cuộc-họp-quý-tư-đã-nén-lại.zip";
+        let gon = rut_gon(goc, 20);
+        assert!(gon.chars().count() <= 20, "{gon}");
+        assert!(gon.ends_with("i.zip"), "{gon}");
+        assert!(gon.starts_with("bản-ghi"), "{gon}");
     }
 }

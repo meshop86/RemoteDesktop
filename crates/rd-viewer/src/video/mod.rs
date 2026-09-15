@@ -19,10 +19,10 @@ use std::sync::Arc;
 use eframe::egui_wgpu::{CallbackTrait, ScreenDescriptor};
 use rd_codec::FrameFormat;
 
-#[cfg(target_os = "macos")]
-use rd_codec::videotoolbox::DecodedFrame;
 #[cfg(target_os = "windows")]
 use rd_codec::mediafoundation::DecodedFrame;
+#[cfg(target_os = "macos")]
+use rd_codec::videotoolbox::DecodedFrame;
 
 /// Số bộ texture giữ lại trong cache.
 ///
@@ -39,7 +39,9 @@ const CACHE_LIMIT: usize = 8;
 fn range_params(format: FrameFormat) -> [f32; 4] {
     match format {
         // 8-bit: luma [16,235], chroma [16,240] quanh tâm 128.
-        FrameFormat::Nv12VideoRange => [255.0 / 219.0, -16.0 / 219.0, 255.0 / 224.0, -128.0 / 224.0],
+        FrameFormat::Nv12VideoRange => {
+            [255.0 / 219.0, -16.0 / 219.0, 255.0 / 224.0, -128.0 / 224.0]
+        }
         // 10-bit nằm ở phần cao của 16 bit: mã 10-bit c được lưu thành c<<6.
         // Luma [64,940] → [4096,60160]; chroma [64,960] quanh tâm 512 → tâm 32768.
         FrameFormat::P210VideoRange => [
@@ -237,7 +239,7 @@ impl VideoRenderer {
         let importer = self.importer.as_mut().expect("vừa dựng ở trên");
         // Khoá cache là chỉ số ô trong vòng — vòng cố định nên cache đầy sau
         // đúng `RING` frame rồi trúng mãi.
-        let key = importer.stage(frame)?;
+        let key = importer.stage(queue, frame)?;
 
         if !self.cache.contains_key(&key) {
             let planes = importer.planes(key);
@@ -264,6 +266,19 @@ impl VideoRenderer {
     /// Phần chung của hai bản `bind_frame`: nạp hệ số dải màu và chọn bind
     /// group sẽ vẽ.
     fn finish(&mut self, queue: &wgpu::Queue, key: usize, frame: &Arc<DecodedFrame>) {
+        // Một dòng duy nhất, ở lần đầu: có nó trong log nghĩa là hàm vẽ lại
+        // thật sự chạy. Thiếu nó mà fps vẫn nhảy nghĩa là frame về tới nơi
+        // nhưng không ai vẽ — đúng lỗi đã làm màn hình đen suốt bao bản.
+        static LAN_DAU: std::sync::Once = std::sync::Once::new();
+        LAN_DAU.call_once(|| {
+            tracing::info!(
+                width = frame.width,
+                height = frame.height,
+                format = ?frame.format,
+                "vẽ frame đầu tiên"
+            );
+        });
+
         queue.write_buffer(&self.uniform, 0, bytemuck_cast(&range_params(frame.format)));
         self.current = Some(
             self.cache
@@ -330,6 +345,36 @@ fn bytemuck_cast(values: &[f32; 4]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of::<[f32; 4]>()) }
 }
 
+/// Lỗi nạp frame gần nhất.
+///
+/// Frame tới nơi mà nạp lên GPU hỏng thì ô video không vẽ gì cả — nhìn y hệt
+/// mất kết nối, trong khi thật ra mọi thứ khác đều chạy. Giữ câu lỗi ở đây để
+/// giao diện nói ra được máy đang hỏng ở đâu thay vì để người dùng đoán.
+static IMPORT_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Câu lỗi của lần nạp frame gần nhất, `None` khi frame cuối vẽ được.
+pub fn import_error() -> Option<String> {
+    IMPORT_ERROR.lock().ok().and_then(|slot| slot.clone())
+}
+
+fn set_import_error(err: Option<String>) {
+    if let Ok(mut slot) = IMPORT_ERROR.lock() {
+        *slot = err;
+    }
+}
+
+/// Đặt bộ vẽ video vào kho tài nguyên của egui.
+///
+/// Phải gọi đúng một lần, ngay khi cửa sổ có `RenderState`. Hàm vẽ lại chỉ
+/// được đưa cho cái kho này chứ không thấy gì khác của chương trình, nên quên
+/// gọi là `paint` không tìm ra bộ vẽ và ô video đen tuyệt đối — trong khi mạng,
+/// giải mã và fps vẫn báo đẹp. Để hàm này nằm cạnh chỗ dùng chính vì thế.
+pub fn install(state: &eframe::egui_wgpu::RenderState) {
+    let renderer = VideoRenderer::new(&state.device, state.target_format);
+    state.renderer.write().callback_resources.insert(renderer);
+    tracing::info!(format = ?state.target_format, "dựng bộ vẽ video");
+}
+
 /// Yêu cầu vẽ một frame, do egui gọi lại đúng lúc trong render pass của nó.
 pub struct VideoCallback {
     pub frame: Arc<DecodedFrame>,
@@ -344,10 +389,20 @@ impl CallbackTrait for VideoCallback {
         _encoder: &mut wgpu::CommandEncoder,
         resources: &mut eframe::egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        if let Some(renderer) = resources.get_mut::<VideoRenderer>() {
-            if let Err(err) = renderer.bind_frame(device, queue, &self.frame) {
+        let Some(renderer) = resources.get_mut::<VideoRenderer>() else {
+            // Chỗ này từng im lặng, và im lặng ở đây nghĩa là màn hình đen
+            // tuyệt đối trong khi mọi con số khác đều đẹp.
+            set_import_error(Some(
+                "chưa dựng bộ vẽ video (thiếu trong kho tài nguyên của egui)".into(),
+            ));
+            return Vec::new();
+        };
+        match renderer.bind_frame(device, queue, &self.frame) {
+            Ok(()) => set_import_error(None),
+            Err(err) => {
                 tracing::warn!(%err, "không nạp được frame vào GPU");
                 renderer.current = None;
+                set_import_error(Some(err.to_string()));
             }
         }
         Vec::new()

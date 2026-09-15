@@ -82,23 +82,110 @@ pub enum MouseButton {
 /// đang dùng), để host bấm đúng phím dù hai máy khác layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyCode {
-    A, B, C, D, E, F, G, H, I, J, K, L, M,
-    N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
-    Digit0, Digit1, Digit2, Digit3, Digit4,
-    Digit5, Digit6, Digit7, Digit8, Digit9,
-    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
-    Escape, Tab, CapsLock, Space, Backspace, Enter,
-    ShiftLeft, ShiftRight, ControlLeft, ControlRight,
-    AltLeft, AltRight, MetaLeft, MetaRight,
-    ArrowUp, ArrowDown, ArrowLeft, ArrowRight,
-    Insert, Delete, Home, End, PageUp, PageDown,
-    Minus, Equal, BracketLeft, BracketRight, Backslash,
-    Semicolon, Quote, Backquote, Comma, Period, Slash,
-    Numpad0, Numpad1, Numpad2, Numpad3, Numpad4,
-    Numpad5, Numpad6, Numpad7, Numpad8, Numpad9,
-    NumpadAdd, NumpadSubtract, NumpadMultiply, NumpadDivide,
-    NumpadDecimal, NumpadEnter, NumLock,
-    PrintScreen, ScrollLock, Pause, ContextMenu,
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    V,
+    W,
+    X,
+    Y,
+    Z,
+    Digit0,
+    Digit1,
+    Digit2,
+    Digit3,
+    Digit4,
+    Digit5,
+    Digit6,
+    Digit7,
+    Digit8,
+    Digit9,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+    Escape,
+    Tab,
+    CapsLock,
+    Space,
+    Backspace,
+    Enter,
+    ShiftLeft,
+    ShiftRight,
+    ControlLeft,
+    ControlRight,
+    AltLeft,
+    AltRight,
+    MetaLeft,
+    MetaRight,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    Insert,
+    Delete,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Minus,
+    Equal,
+    BracketLeft,
+    BracketRight,
+    Backslash,
+    Semicolon,
+    Quote,
+    Backquote,
+    Comma,
+    Period,
+    Slash,
+    Numpad0,
+    Numpad1,
+    Numpad2,
+    Numpad3,
+    Numpad4,
+    Numpad5,
+    Numpad6,
+    Numpad7,
+    Numpad8,
+    Numpad9,
+    NumpadAdd,
+    NumpadSubtract,
+    NumpadMultiply,
+    NumpadDivide,
+    NumpadDecimal,
+    NumpadEnter,
+    NumLock,
+    PrintScreen,
+    ScrollLock,
+    Pause,
+    ContextMenu,
 }
 
 /// Toạ độ chuột luôn chuẩn hoá về [0.0, 1.0] theo màn hình đang xem, nên viewer
@@ -221,6 +308,13 @@ pub enum ViewerCommand {
     FileReject {
         transfer_id: u64,
     },
+    /// Bỏ giữa chừng một lần truyền đã bắt đầu — hoặc rút lại lời mời chưa
+    /// được trả lời. Khác [`ViewerCommand::FileReject`] ở chỗ bên nào cũng gửi
+    /// được, bất kể ai là người mời: người gửi đổi ý cũng có quyền như người
+    /// nhận đổi ý.
+    FileCancel {
+        transfer_id: u64,
+    },
     FileChunkAck(FileChunkAck),
     /// Clipboard bên viewer vừa đổi.
     Clipboard(ClipboardText),
@@ -256,6 +350,10 @@ pub enum HostEvent {
         transfer_id: u64,
     },
     FileReject {
+        transfer_id: u64,
+    },
+    /// Đối xứng với [`ViewerCommand::FileCancel`].
+    FileCancel {
         transfer_id: u64,
     },
     /// Đối xứng với [`ViewerCommand::FileChunkAck`]: file đi được cả hai chiều
@@ -340,7 +438,11 @@ mod tests {
         // dưới và người dùng chỉ thấy "mất kết nối".
         let text = "🙂".repeat(MAX_CLIPBOARD_TEXT / 4);
         let bytes = encode_control(&ViewerCommand::Clipboard(ClipboardText { text }));
-        assert!(bytes.len() <= MAX_CLIPBOARD_TEXT + 16, "{} byte", bytes.len());
+        assert!(
+            bytes.len() <= MAX_CLIPBOARD_TEXT + 16,
+            "{} byte",
+            bytes.len()
+        );
     }
 
     #[test]
@@ -352,6 +454,10 @@ mod tests {
             x: 0.5,
             y: 0.5,
         }));
-        assert!(bytes.len() <= 16, "input event {} byte, quá lớn", bytes.len());
+        assert!(
+            bytes.len() <= 16,
+            "input event {} byte, quá lớn",
+            bytes.len()
+        );
     }
 }

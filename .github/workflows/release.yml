@@ -93,6 +93,7 @@ jobs:
           mkdir -p dist/windows
           cp target/release/remote-desktop.exe dist/windows/
           cp target/release/rd-rendezvous.exe dist/windows/
+          cp packaging/windows/tu-kiem.ps1 dist/windows/
           cd dist/windows
           7z a "../RemoteDesktop-${{ steps.version.outputs.value }}-windows.zip" .
 

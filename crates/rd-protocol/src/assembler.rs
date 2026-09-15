@@ -30,6 +30,9 @@ pub struct AssemblerStats {
     pub packets_received: u64,
     /// Số fragment còn thiếu của các frame đã bị bỏ — xấp xỉ số gói mất.
     pub packets_lost: u64,
+    /// Gói không đọc được hoặc mâu thuẫn với các gói khác của cùng frame.
+    /// Vài gói là chuyện thường; tăng đều đặn nghĩa là có kẻ bắn gói rác vào.
+    pub packets_invalid: u64,
 }
 
 struct Partial {
@@ -73,7 +76,13 @@ impl FrameAssembler {
 
     /// Nạp một datagram. Trả về `Some(frame)` ngay khi frame đủ fragment.
     pub fn push(&mut self, packet: &[u8]) -> Result<Option<AssembledFrame>> {
-        let (header, body) = VideoHeader::parse(packet)?;
+        let (header, body) = match VideoHeader::parse(packet) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                self.stats.packets_invalid += 1;
+                return Err(err);
+            }
+        };
         self.stats.packets_received += 1;
 
         // Bỏ fragment thuộc frame cũ hơn frame đã hoàn chỉnh gần nhất: decoder
@@ -84,19 +93,23 @@ impl FrameAssembler {
             return Ok(None);
         }
 
-        let entry = self.partial.entry(header.frame_id).or_insert_with(|| Partial {
-            fragments: vec![None; header.fragment_count as usize],
-            received: 0,
-            total_len: 0,
-            monitor: header.monitor,
-            codec: header.codec,
-            keyframe: header.flags.is_keyframe(),
-            capture_us: header.capture_us,
-        });
+        let entry = self
+            .partial
+            .entry(header.frame_id)
+            .or_insert_with(|| Partial {
+                fragments: vec![None; header.fragment_count as usize],
+                received: 0,
+                total_len: 0,
+                monitor: header.monitor,
+                codec: header.codec,
+                keyframe: header.flags.is_keyframe(),
+                capture_us: header.capture_us,
+            });
 
         let idx = header.fragment_idx as usize;
         if idx >= entry.fragments.len() {
             // fragment_count không khớp giữa các gói của cùng frame: gói hỏng.
+            self.stats.packets_invalid += 1;
             return Ok(None);
         }
         if entry.fragments[idx].is_some() {
@@ -172,6 +185,7 @@ fn is_newer(candidate: u32, reference: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MAX_VIDEO_PAYLOAD;
     use crate::video::fragment_frame;
 
     fn payload(len: usize) -> Vec<u8> {
@@ -181,7 +195,7 @@ mod tests {
     #[test]
     fn reassembles_multi_fragment_frame() {
         let data = payload(10_000);
-        let packets = fragment_frame(&data, 1, 0, Codec::Hevc, true, 12345);
+        let packets = fragment_frame(&data, 1, 0, Codec::Hevc, true, 12345, MAX_VIDEO_PAYLOAD);
         let mut assembler = FrameAssembler::default();
 
         let mut out = None;
@@ -201,7 +215,7 @@ mod tests {
     #[test]
     fn out_of_order_fragments_still_assemble() {
         let data = payload(4000);
-        let mut packets = fragment_frame(&data, 7, 0, Codec::H264, false, 1);
+        let mut packets = fragment_frame(&data, 7, 0, Codec::H264, false, 1, MAX_VIDEO_PAYLOAD);
         packets.reverse();
         let mut assembler = FrameAssembler::default();
         let mut out = None;
@@ -216,8 +230,16 @@ mod tests {
     #[test]
     fn missing_fragment_drops_frame_and_counts_loss() {
         let data = payload(10_000);
-        let broken = fragment_frame(&data, 1, 0, Codec::Hevc, true, 0);
-        let good = fragment_frame(&payload(500), 2, 0, Codec::Hevc, false, 0);
+        let broken = fragment_frame(&data, 1, 0, Codec::Hevc, true, 0, MAX_VIDEO_PAYLOAD);
+        let good = fragment_frame(
+            &payload(500),
+            2,
+            0,
+            Codec::Hevc,
+            false,
+            0,
+            MAX_VIDEO_PAYLOAD,
+        );
         let mut assembler = FrameAssembler::default();
 
         // Frame 1 mất gói đầu nên không bao giờ đủ.
@@ -240,8 +262,24 @@ mod tests {
 
     #[test]
     fn late_fragments_of_old_frame_are_ignored() {
-        let old = fragment_frame(&payload(300), 5, 0, Codec::Hevc, false, 0);
-        let new = fragment_frame(&payload(300), 9, 0, Codec::Hevc, false, 0);
+        let old = fragment_frame(
+            &payload(300),
+            5,
+            0,
+            Codec::Hevc,
+            false,
+            0,
+            MAX_VIDEO_PAYLOAD,
+        );
+        let new = fragment_frame(
+            &payload(300),
+            9,
+            0,
+            Codec::Hevc,
+            false,
+            0,
+            MAX_VIDEO_PAYLOAD,
+        );
         let mut assembler = FrameAssembler::default();
         assert!(assembler.push(&new[0]).unwrap().is_some());
         assert!(assembler.push(&old[0]).unwrap().is_none());
@@ -253,9 +291,51 @@ mod tests {
         let mut assembler = FrameAssembler::new(2);
         // Mỗi frame gửi thiếu 1 gói nên không frame nào hoàn thành.
         for id in 1..=5u32 {
-            let packets = fragment_frame(&payload(5000), id, 0, Codec::Hevc, false, 0);
+            let packets = fragment_frame(
+                &payload(5000),
+                id,
+                0,
+                Codec::Hevc,
+                false,
+                0,
+                MAX_VIDEO_PAYLOAD,
+            );
             assembler.push(&packets[0]).unwrap();
         }
         assert!(assembler.stats().frames_dropped >= 2);
+    }
+}
+
+#[cfg(test)]
+mod goi_rac_tests {
+    use super::*;
+    use crate::control::Codec;
+    use crate::video::{MAX_FRAME_FRAGMENTS, VIDEO_HEADER_LEN, VideoFlags, VideoHeader};
+
+    fn goi(idx: u16, count: u16) -> Vec<u8> {
+        let header = VideoHeader {
+            flags: VideoFlags(0),
+            monitor: 0,
+            codec: Codec::H264,
+            frame_id: 1,
+            fragment_idx: idx,
+            fragment_count: count,
+            capture_us: 0,
+        };
+        let mut buf = [0u8; VIDEO_HEADER_LEN];
+        header.write_to(&mut buf);
+        buf.to_vec()
+    }
+
+    #[test]
+    fn so_manh_bia_khong_cap_phat_duoc_bo_nho() {
+        let mut assembler = FrameAssembler::new(4);
+        assert!(assembler.push(&goi(0, u16::MAX)).is_err());
+        assert!(assembler.push(&goi(0, 0)).is_err());
+        assert!(assembler.push(&goi(5, 2)).is_err());
+        assert_eq!(assembler.stats().packets_invalid, 3);
+        assert_eq!(assembler.stats().packets_received, 0);
+        // Ngay dưới trần thì vẫn nhận, để frame thật không bị chặn nhầm.
+        assert!(assembler.push(&goi(0, MAX_FRAME_FRAGMENTS as u16)).is_ok());
     }
 }

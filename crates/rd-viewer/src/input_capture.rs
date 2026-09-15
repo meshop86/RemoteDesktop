@@ -65,11 +65,27 @@ impl InputCapture {
                         clamp_to(*pos, video)
                     };
                     if let Some((x, y)) = point {
-                        out.push(InputEvent::MouseMove {
+                        let moved = InputEvent::MouseMove {
                             monitor: MONITOR,
                             x,
                             y,
-                        });
+                        };
+                        // Một khung egui có thể gom vài chục lần chuột nhúc
+                        // nhích; gửi hết sang thì máy kia phải xử lý cả xâu
+                        // toạ độ đã lỗi thời chỉ để tới được điểm cuối, và vì
+                        // đường điều khiển là kênh tin cậy nên cái nào kẹt là
+                        // cả xâu kẹt theo. Chuột rê không thì chỉ điểm cuối có
+                        // nghĩa, nên ghi đè luôn điểm trước.
+                        match out.last_mut() {
+                            Some(last @ InputEvent::MouseMove { .. })
+                                if self.held_buttons.is_empty() =>
+                            {
+                                *last = moved;
+                            }
+                            // Đang giữ nút thì đường đi mới là nội dung: bôi
+                            // đen, vẽ, kéo thả đều hỏng nếu bỏ điểm giữa.
+                            _ => out.push(moved),
+                        }
                     }
                 }
 
@@ -392,6 +408,51 @@ mod tests {
     }
 
     #[test]
+    fn nhieu_lan_re_chuot_trong_mot_khung_chi_con_diem_cuoi() {
+        let mut capture = InputCapture::new();
+        let events = [
+            Event::PointerMoved(Pos2::new(200.0, 100.0)),
+            Event::PointerMoved(Pos2::new(300.0, 200.0)),
+            Event::PointerMoved(Pos2::new(500.0, 350.0)),
+        ];
+        let out = capture.translate(&events, video());
+        assert_eq!(
+            out,
+            vec![InputEvent::MouseMove {
+                monitor: 0,
+                x: 0.5,
+                y: 0.5
+            }]
+        );
+    }
+
+    #[test]
+    fn dang_giu_nut_thi_giu_nguyen_duong_di() {
+        let mut capture = InputCapture::new();
+        let press = Event::PointerButton {
+            pos: Pos2::new(200.0, 100.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let events = [
+            press,
+            Event::PointerMoved(Pos2::new(300.0, 200.0)),
+            Event::PointerMoved(Pos2::new(400.0, 300.0)),
+            Event::PointerMoved(Pos2::new(500.0, 350.0)),
+        ];
+        let out = capture.translate(&events, video());
+        let moves = out
+            .iter()
+            .filter(|e| matches!(e, InputEvent::MouseMove { .. }))
+            .count();
+        assert_eq!(
+            moves, 3,
+            "kéo mà mất điểm giữa thì bôi đen/vẽ hỏng: {out:?}"
+        );
+    }
+
+    #[test]
     fn chuot_o_vien_den_thi_khong_gui() {
         let mut capture = InputCapture::new();
         // Bên trái ô video: người dùng đang rê chuột trên viền, không phải đang
@@ -454,10 +515,7 @@ mod tests {
     fn co_phim_roi_thi_bo_text_di_kem() {
         let mut capture = InputCapture::new();
         // Một lần bấm 'a' sinh ra cả hai sự kiện này.
-        let out = capture.translate(
-            &[key_event(Key::A, true), Event::Text("a".into())],
-            video(),
-        );
+        let out = capture.translate(&[key_event(Key::A, true), Event::Text("a".into())], video());
         assert_eq!(
             out,
             vec![InputEvent::Key {

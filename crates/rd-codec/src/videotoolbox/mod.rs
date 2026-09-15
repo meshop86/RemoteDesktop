@@ -52,9 +52,7 @@ pub(crate) fn cf_dict1(key: &CFString, value: &CFType) -> CFRetained<CFDictionar
 }
 
 /// Từ điển nhiều cặp key/value.
-pub(crate) fn cf_dict(
-    pairs: &[(&CFString, &CFType)],
-) -> CFRetained<CFDictionary<CFType, CFType>> {
+pub(crate) fn cf_dict(pairs: &[(&CFString, &CFType)]) -> CFRetained<CFDictionary<CFType, CFType>> {
     let keys: Vec<&CFType> = pairs.iter().map(|(key, _)| *key as &CFType).collect();
     let values: Vec<&CFType> = pairs.iter().map(|(_, value)| *value).collect();
     CFDictionary::from_slices(&keys, &values)
@@ -125,7 +123,10 @@ pub(crate) fn copy_bool_property(session: &CFType, key: &CFString) -> Option<boo
 pub(crate) fn guard_callback(what: &'static str, body: impl FnOnce()) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
     if result.is_err() {
-        tracing::error!(callback = what, "callback của VideoToolbox panic — bỏ frame");
+        tracing::error!(
+            callback = what,
+            "callback của VideoToolbox panic — bỏ frame"
+        );
     }
 }
 

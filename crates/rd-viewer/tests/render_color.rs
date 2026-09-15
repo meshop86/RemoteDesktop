@@ -33,9 +33,9 @@ const OUT_H: u32 = 36;
 /// Ba dải màu bão hoà. Bão hoà là trường hợp khó nhất cho 4:2:2: chroma bị giảm
 /// một nửa theo chiều ngang, còn dải hẹp thì cắt cụt hai đầu thang giá trị.
 const BANDS: [[u8; 3]; 3] = [
-    [220, 40, 40],  // đỏ
-    [40, 200, 60],  // xanh lá
-    [50, 70, 230],  // xanh dương
+    [220, 40, 40], // đỏ
+    [40, 200, 60], // xanh lá
+    [50, 70, 230], // xanh dương
 ];
 
 /// Sai số cho phép trên mỗi kênh, thang 0-255.
@@ -66,8 +66,7 @@ fn mau_qua_shader_khop_voi_mau_goc() {
         keyframe_interval_secs: 1,
     })
     .expect("tạo bộ mã hoá");
-    let mut decoder =
-        VtDecoder::new(Codec::Hevc, encoder.actual_chroma()).expect("tạo bộ giải mã");
+    let mut decoder = VtDecoder::new(Codec::Hevc, encoder.actual_chroma()).expect("tạo bộ giải mã");
 
     // Vài frame giống hệt nhau để bộ mã hoá qua giai đoạn dò bitrate, rồi mới
     // lấy frame cuối làm mẫu đo.
@@ -215,12 +214,10 @@ fn render_readback(
 /// Ảnh nguồn: ba dải màu ngang, đúng định dạng mà ScreenCaptureKit trả về.
 fn make_bgra_bands() -> CFRetained<CVPixelBuffer> {
     let yes = objc2_core_foundation::CFBoolean::new(true);
-    let empty: CFRetained<CFDictionary<CFType, CFType>> =
-        CFDictionary::from_slices(&[], &[]);
-    let keys: [&CFType; 2] = [
-        unsafe { kCVPixelBufferIOSurfacePropertiesKey },
-        unsafe { kCVPixelBufferMetalCompatibilityKey },
-    ];
+    let empty: CFRetained<CFDictionary<CFType, CFType>> = CFDictionary::from_slices(&[], &[]);
+    let keys: [&CFType; 2] = [unsafe { kCVPixelBufferIOSurfacePropertiesKey }, unsafe {
+        kCVPixelBufferMetalCompatibilityKey
+    }];
     let values: [&CFType; 2] = [&empty, yes];
     let attributes = CFDictionary::from_slices(&keys, &values);
     // Hàm C nhận CFDictionary không tham số kiểu; cả hai là cùng một struct rỗng.

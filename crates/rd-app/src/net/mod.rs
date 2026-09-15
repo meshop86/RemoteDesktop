@@ -12,12 +12,13 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use rd_protocol::control::{ChatMessage, FileOffer, InputEvent};
+use anyhow::Context as _;
+use rd_protocol::control::{ChatMessage, FileOffer, InputEvent, MonitorInfo};
 use rd_signal::PeerId;
 use rd_transport::LinkStats;
 use rd_viewer::pipeline::{PipelineFrame, PipelineInfo};
@@ -61,6 +62,11 @@ pub struct NetConfig {
     /// Vân tay chứng chỉ của host (viewer ghim). `None` là chấp nhận bất kỳ;
     /// lúc đó thứ duy nhất chặn kẻ đứng giữa là mật khẩu phiên.
     pub peer_fingerprint: Option<[u8; 32]>,
+    /// Cho máy cùng tài khoản Tailscale vào mà không cần mật khẩu.
+    ///
+    /// Chỉ có nghĩa với host. Đổi lại sự tiện ấy, ranh giới an toàn chuyển sang
+    /// tailnet: ai vào được tài khoản Tailscale là vào được máy này.
+    pub trust_tailnet: bool,
     /// Nơi cần tới, chỉ dùng khi [`Role::Viewer`].
     pub peer: Option<PeerAddress>,
     /// Tên hiện cho đầu kia thấy.
@@ -72,6 +78,12 @@ pub struct NetConfig {
     /// Card đồ hoạ của **máy đang xem** có hiển thị được 10-bit không.
     pub allow_10bit: bool,
     pub download_dir: PathBuf,
+    /// Đường ghi clipboard của máy này, cho phần mạng dùng thẳng.
+    ///
+    /// Không đi vòng qua giao diện vì giao diện có thể đang thu nhỏ, mà cửa sổ
+    /// thu nhỏ thì luồng vẽ đứng im — clipboard sẽ chỉ sang được máy kia khi
+    /// người dùng bấm vào cửa sổ.
+    pub clipboard: crate::os::ClipboardSink,
 }
 
 /// Việc xảy ra ở phần mạng mà giao diện cần biết.
@@ -89,10 +101,20 @@ pub enum NetEvent {
     },
     /// Thông số video, có sau khi bắt tay xong.
     Info(Box<PipelineInfo>),
+    /// Các màn hình của host và màn hình đang xem.
+    Monitors {
+        list: Vec<MonitorInfo>,
+        active: u8,
+    },
     OutgoingOffer(FileOffer),
     IncomingOffer(FileOffer),
     TransferAccepted(u64),
     TransferRejected(u64),
+    /// Một lần truyền bị bỏ giữa chừng. `by_peer` để giao diện nói đúng ai đổi ý.
+    TransferCancelled {
+        id: u64,
+        by_peer: bool,
+    },
     TransferProgress {
         id: u64,
         done: u64,
@@ -106,8 +128,6 @@ pub enum NetEvent {
         reason: String,
     },
     Chat(ChatMessage),
-    /// Clipboard đầu kia vừa đổi — ghi đè clipboard máy này.
-    Clipboard(String),
     Link(LinkStats),
     /// Độ trễ một chiều đo được sau khi đồng bộ đồng hồ, tính bằng micro giây.
     Latency(u64),
@@ -128,8 +148,12 @@ pub enum UiCommand {
     SendFile(PathBuf),
     AcceptFile(u64),
     RejectFile(u64),
+    /// Đổi ý: bỏ lời mời chưa được trả lời, hoặc cắt ngang lần truyền đang chạy.
+    CancelFile(u64),
     RequestKeyframe,
     SetBitrate(u32),
+    /// Viewer xin xem màn hình khác của host.
+    SelectMonitor(u8),
 }
 
 /// Khoảng cách tối thiểu giữa hai lần tự xin keyframe.
@@ -139,12 +163,38 @@ pub enum UiCommand {
 /// truyền đang yếu. 250 ms đủ cho gần như mọi đường truyền thực tế đáp lại.
 const KEYFRAME_COOLDOWN_US: u64 = 250_000;
 
+/// Cái chuông để phần mạng đánh thức luồng vẽ.
+///
+/// Không có nó thì giao diện phải vẽ lại liên tục mới kịp thấy frame mới —
+/// tốn CPU cả những lúc màn hình đứng yên. Có nó, giao diện ngủ tới khi thực
+/// sự có việc. `OnceLock` vì `egui::Context` chỉ tồn tại sau khi cửa sổ mở,
+/// muộn hơn lúc phần mạng khởi động.
+#[derive(Clone, Default)]
+pub struct Waker(Arc<std::sync::OnceLock<egui::Context>>);
+
+impl Waker {
+    /// Gắn ngữ cảnh vẽ vào chuông. Gọi lại nhiều lần cũng không sao.
+    pub fn attach(&self, ctx: &egui::Context) {
+        if self.0.get().is_none() {
+            let _ = self.0.set(ctx.clone());
+        }
+    }
+
+    fn wake(&self) {
+        if let Some(ctx) = self.0.get() {
+            ctx.request_repaint();
+        }
+    }
+}
+
 /// Ngữ cảnh dùng chung cho mọi task của phần mạng.
 pub struct Context {
     pub config: NetConfig,
     pub events: EventSink,
     pub frames: SyncSender<PipelineFrame>,
     pub stop: Arc<AtomicBool>,
+    /// Chuông đánh thức luồng vẽ mỗi khi có frame mới.
+    waker: Waker,
     /// Đường vòng lại chính kênh lệnh của giao diện. Nhờ nó, chỗ nào trong phần
     /// mạng cũng tự phát được lệnh mà không cần biết đường đi tới bộ gửi.
     commands: tokio::sync::mpsc::UnboundedSender<UiCommand>,
@@ -153,9 +203,19 @@ pub struct Context {
 }
 
 impl Context {
-    /// Băm mật khẩu phiên. Đây là thứ đi trên dây, không phải mật khẩu trần.
-    pub fn auth(&self) -> [u8; 32] {
-        *blake3::hash(self.config.password.as_bytes()).as_bytes()
+    /// Bằng chứng biết mật khẩu, dành riêng cho *một* kết nối.
+    ///
+    /// Không gửi mật khẩu trần, mà cũng không gửi băm trần: băm trần thì kẻ
+    /// đứng giữa (một rendezvous server bị chiếm chẳng hạn) chỉ cần bắt lại
+    /// rồi phát sang host thật là vào được mà chẳng cần biết mật khẩu. Trộn
+    /// thêm ràng buộc kênh của chính kết nối này thì con số bắt được ở kết nối
+    /// A không dùng lại được ở kết nối B.
+    pub fn auth(&self, session: &rd_transport::Session) -> anyhow::Result<[u8; 32]> {
+        let binding = session
+            .channel_binding()
+            .context("không lấy được ràng buộc kênh của kết nối")?;
+        let key = blake3::hash(self.config.password.as_bytes());
+        Ok(*blake3::keyed_hash(key.as_bytes(), &binding).as_bytes())
     }
 
     /// Xin host phát keyframe vì chuỗi dự đoán đã đứt (mất gói, hoặc ta phải
@@ -183,10 +243,18 @@ impl Context {
         true
     }
 
+    /// Xin keyframe bất kể thời gian chờ. Dùng khi bộ giải mã vừa được dựng
+    /// lại: nó không còn khung tham chiếu nào, chờ hết cooldown là chờ vô ích.
+    pub fn force_keyframe(&self) {
+        self.last_keyframe_us.store(now_us(), Ordering::Relaxed);
+        let _ = self.commands.send(UiCommand::RequestKeyframe);
+    }
+
     /// Đẩy frame lên giao diện, bỏ frame cũ nếu giao diện chưa vẽ kịp.
     pub fn push_frame(&self, frame: PipelineFrame) {
         match self.frames.try_send(frame) {
-            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+            Ok(()) => self.waker.wake(),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {}
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 self.stop.store(true, Ordering::Relaxed);
             }
@@ -200,11 +268,15 @@ impl Context {
 /// giao diện đã đóng hay chưa — lúc đó gửi thất bại là chuyện đúng, không phải
 /// lỗi cần xử lý.
 #[derive(Clone)]
-pub struct EventSink(std::sync::mpsc::Sender<NetEvent>);
+pub struct EventSink {
+    tx: std::sync::mpsc::Sender<NetEvent>,
+    waker: Waker,
+}
 
 impl EventSink {
     pub fn send(&self, event: NetEvent) {
-        let _ = self.0.send(event);
+        let _ = self.tx.send(event);
+        self.waker.wake();
     }
 
     pub fn status(&self, text: impl Into<String>) {
@@ -213,6 +285,72 @@ impl EventSink {
         self.send(NetEvent::Status(text));
     }
 }
+
+/// Báo lên giao diện phiên này đang đi thẳng hay vòng qua máy chủ DERP.
+///
+/// Đây là thứ quyết định chất lượng hình khi chạy trên Tailscale: nối thẳng thì
+/// độ trễ bằng mạng thật, còn vòng qua DERP là gói tin phải chạy tới máy chủ
+/// trung chuyển của Tailscale rồi mới quay về, thường thêm vài chục ms và giới
+/// hạn băng thông. Người dùng không thấy được điều đó nếu không nói ra.
+///
+/// Chờ vài giây rồi mới hỏi vì Tailscale luôn khởi động bằng DERP và chỉ nâng
+/// cấp lên nối thẳng sau khi đục NAT xong — hỏi ngay lúc vừa nối thì lần nào
+/// cũng thấy DERP.
+/// `derp` nhận trần bitrate của đường vòng, tính bằng kbps; 0 nghĩa là không
+/// kẹp. Chỉ phía host truyền vào — nó là bên chọn mức mã hoá.
+pub fn bao_duong_di(
+    events: EventSink,
+    ip: std::net::IpAddr,
+    derp: Option<Arc<AtomicU32>>,
+) -> AbortOnDrop<()> {
+    AbortOnDrop(tokio::spawn(async move {
+        if !crate::tailscale::is_tailnet_ip(ip) {
+            return;
+        }
+        // Hỏi lại vài lượt: Tailscale hay bắt đầu bằng DERP rồi mới nâng lên
+        // nối thẳng, mà lần nâng ấy có khi tới sau cả chục giây. Hỏi một lần
+        // là báo sai rồi hạ bitrate oan cho cả phiên.
+        let mut truoc = None;
+        for lan in 0..DO_DUONG_SO_LAN {
+            tokio::time::sleep(DO_DUONG_CACH * (lan + 1)).await;
+            let Ok(Some(path)) =
+                tokio::task::spawn_blocking(move || crate::tailscale::path_to(ip)).await
+            else {
+                continue;
+            };
+            let vong = matches!(path, crate::tailscale::Path::Derp(_));
+            if let Some(derp) = &derp {
+                let kbps = if vong { rd_session::rate::DERP_KBPS } else { 0 };
+                derp.store(kbps, Ordering::Relaxed);
+            }
+            // Chỉ nói khi đường đổi, không nhắc lại điều đã nói.
+            if truoc == Some(vong) {
+                continue;
+            }
+            truoc = Some(vong);
+            match path {
+                crate::tailscale::Path::Direct(addr) => {
+                    events.status(format!("đường đi: nối thẳng tới {addr}"));
+                }
+                crate::tailscale::Path::Derp(vung) => {
+                    let vung = if vung.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({vung})")
+                    };
+                    events.status(format!(
+                        "đường đi: vòng qua máy trung chuyển DERP{vung} — hạ bitrate cho đỡ giật"
+                    ));
+                }
+            }
+        }
+    }))
+}
+
+/// Hỏi đường đi bao nhiêu lần sau khi nối, và cách nhau bao lâu. Khoảng cách
+/// nhân dần theo lượt nên lượt cuối rơi vào khoảng nửa phút sau khi vào phiên.
+const DO_DUONG_SO_LAN: u32 = 4;
+const DO_DUONG_CACH: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Task bị huỷ khi guard rời phạm vi.
 ///
@@ -233,6 +371,7 @@ pub struct NetHandle {
     frames: Receiver<PipelineFrame>,
     commands: tokio::sync::mpsc::UnboundedSender<UiCommand>,
     stop: Arc<AtomicBool>,
+    waker: Waker,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -242,6 +381,7 @@ impl NetHandle {
         let (frame_tx, frame_rx) = sync_channel(1);
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let waker = Waker::default();
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -250,9 +390,13 @@ impl NetHandle {
 
         let ctx = Arc::new(Context {
             config,
-            events: EventSink(event_tx),
+            events: EventSink {
+                tx: event_tx,
+                waker: waker.clone(),
+            },
             frames: frame_tx,
             stop: stop.clone(),
+            waker: waker.clone(),
             commands: cmd_tx.clone(),
             last_keyframe_us: AtomicU64::new(0),
         });
@@ -296,8 +440,15 @@ impl NetHandle {
             frames: frame_rx,
             commands: cmd_tx,
             stop,
+            waker,
             thread: Some(thread),
         })
+    }
+
+    /// Cho phần mạng biết đường đánh thức luồng vẽ. Gọi mỗi lần vẽ cho gọn,
+    /// lần đầu là lần duy nhất có tác dụng.
+    pub fn attach(&self, ctx: &egui::Context) {
+        self.waker.attach(ctx);
     }
 
     /// Rút hết sự kiện đang chờ. Gọi mỗi lần vẽ.
@@ -316,6 +467,14 @@ impl NetHandle {
 
     pub fn send(&self, command: UiCommand) {
         let _ = self.commands.send(command);
+    }
+
+    /// Đầu gửi lệnh, sao chép được để luồng khác dùng.
+    ///
+    /// Dùng cho những việc không được chờ luồng vẽ giao diện — clipboard chẳng
+    /// hạn, vì cửa sổ thu nhỏ là luồng ấy đứng im.
+    pub fn commands(&self) -> tokio::sync::mpsc::UnboundedSender<UiCommand> {
+        self.commands.clone()
     }
 }
 

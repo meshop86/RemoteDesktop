@@ -14,7 +14,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-version="${1:-0.1.0}"
+version="${1:-$(grep -m1 '^version' "$(dirname "$0")/../../Cargo.toml" | cut -d'"' -f2)}"
 shift || true
 targets=("$@")
 if [ ${#targets[@]} -eq 0 ]; then
@@ -77,6 +77,14 @@ rm -f "$dmg"
 staging="$(mktemp -d)"
 cp -R "$app" "$staging/"
 ln -s /Applications "$staging/Applications"
+# Kèm bộ cài Tailscale chính thức: đường nối máy chính của phần mềm cần nó.
+# Gói .pkg này đã được Apple chứng thực nên mở từ dmg không bị Gatekeeper chặn.
+ts_pkg="$HOME/Library/Caches/rd-tailscale/Tailscale-macos.pkg"
+if [ ! -f "$ts_pkg" ]; then
+	mkdir -p "$(dirname "$ts_pkg")"
+	curl -fL -o "$ts_pkg" https://pkgs.tailscale.com/stable/Tailscale-latest-macos.pkg
+fi
+cp "$ts_pkg" "$staging/Cài Tailscale.pkg"
 hdiutil create -volname "Remote Desktop" -srcfolder "$staging" -ov -format UDZO "$dmg" >/dev/null
 rm -rf "$staging"
 

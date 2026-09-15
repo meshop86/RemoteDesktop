@@ -1,9 +1,16 @@
 name: CI
 
+# Chỉ chạy khi bấm tay. Quota Actions của dự án này đã cạn, mà runner macOS
+# tính giá gấp 10 lần runner Linux — mỗi lần đẩy code lên là mất vài chục phút
+# hạn mức. Kiểm tra tương đương chạy được ngay trên máy:
+#
+#     cargo clippy --workspace --all-targets -- -D warnings
+#     cargo test --workspace
+#     cargo check --workspace --target x86_64-pc-windows-msvc   # nhánh Windows
+#
+# Lệnh thứ ba cần `cargo xwin` cho những crate có mã C (ring); riêng rd-codec,
+# rd-capture, rd-input thì `cargo check --target` thường là đủ.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 env:

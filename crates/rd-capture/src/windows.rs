@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows_capture::capture::{
@@ -262,9 +262,42 @@ fn supported(query: fn() -> std::result::Result<bool, GraphicsCaptureError>) -> 
     query().unwrap_or(false)
 }
 
+/// Vị trí và kích thước màn hình trong hệ toạ độ chung của Windows.
+///
+/// `Monitor` của windows-capture chỉ cho bề ngang/cao; vị trí phải tự hỏi
+/// `GetMonitorInfoW`, mà không có nó thì không biết màn hình phụ nằm bên trái
+/// hay bên phải để bơm chuột cho đúng chỗ.
+fn monitor_rect(monitor: &Monitor) -> Option<(i32, i32, u32, u32)> {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let handle = HMONITOR(monitor.as_raw_hmonitor());
+    if !unsafe { GetMonitorInfoW(handle, &mut info) }.as_bool() {
+        return None;
+    }
+    let rect = info.rcMonitor;
+    Some((
+        rect.left,
+        rect.top,
+        (rect.right - rect.left).max(0) as u32,
+        (rect.bottom - rect.top).max(0) as u32,
+    ))
+}
+
 fn describe(monitor: &Monitor, index: usize, target_fps: u32) -> DisplayInfo {
     // Mọi trường đều có thể đọc hỏng (màn hình vừa bị rút chẳng hạn); rơi về
     // giá trị hợp lý còn hơn làm hỏng cả danh sách vì một màn hình.
+    let (origin_x, origin_y, logical_width, logical_height) =
+        monitor_rect(monitor).unwrap_or_else(|| {
+            (
+                0,
+                0,
+                monitor.width().unwrap_or(0),
+                monitor.height().unwrap_or(0),
+            )
+        });
     DisplayInfo {
         id: index as u32,
         name: monitor
@@ -277,6 +310,10 @@ fn describe(monitor: &Monitor, index: usize, target_fps: u32) -> DisplayInfo {
         scale: 1.0,
         refresh_hz: monitor.refresh_rate().unwrap_or(target_fps),
         is_primary: index == 0,
+        origin_x,
+        origin_y,
+        logical_width,
+        logical_height,
     }
 }
 

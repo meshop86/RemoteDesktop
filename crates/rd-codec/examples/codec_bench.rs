@@ -68,7 +68,11 @@ mod macos {
         println!("=== {codec:?} {WIDTH}x{HEIGHT} @ {target_fps}fps ===");
         println!(
             "phần cứng: {}   chroma thực tế: {:?}",
-            if encoder.is_hardware() { "có" } else { "KHÔNG" },
+            if encoder.is_hardware() {
+                "có"
+            } else {
+                "KHÔNG"
+            },
             encoder.actual_chroma()
         );
 
@@ -193,9 +197,10 @@ mod macos {
                 Some(decoded) => {
                     if !reported {
                         reported = true;
-                        let fourcc =
-                            objc2_core_video::CVPixelBufferGetPixelFormatType(decoded.pixel_buffer())
-                                .to_be_bytes();
+                        let fourcc = objc2_core_video::CVPixelBufferGetPixelFormatType(
+                            decoded.pixel_buffer(),
+                        )
+                        .to_be_bytes();
                         println!(
                             "  định dạng pixel đầu ra: '{}' = {:?} ({} plane)",
                             String::from_utf8_lossy(&fourcc),
@@ -218,7 +223,10 @@ mod macos {
             "  frame: {} giải mã được / {} gửi vào, rơi {}, lỗi {}",
             stats.frames_emitted, stats.frames_submitted, stats.frames_dropped, stats.errors
         );
-        assert_eq!(mismatched, 0, "có frame sai kích thước hoặc không giải mã được");
+        assert_eq!(
+            mismatched, 0,
+            "có frame sai kích thước hoặc không giải mã được"
+        );
         assert_eq!(
             stats.frames_emitted as usize,
             encoded.len(),
@@ -267,8 +275,9 @@ mod macos {
         let key: &CFType = unsafe { kCVPixelBufferIOSurfacePropertiesKey };
         let value: &CFType = &empty;
         let attributes = CFDictionary::from_slices(&[key], &[value]);
-        let attributes: &CFDictionary =
-            unsafe { &*(&*attributes as *const CFDictionary<CFType, CFType> as *const CFDictionary) };
+        let attributes: &CFDictionary = unsafe {
+            &*(&*attributes as *const CFDictionary<CFType, CFType> as *const CFDictionary)
+        };
 
         let mut raw: *mut CVPixelBuffer = null_mut();
         let status = unsafe {

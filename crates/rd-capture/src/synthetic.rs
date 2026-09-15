@@ -56,6 +56,10 @@ impl ScreenCapturer for SyntheticCapturer {
             scale: 1.0,
             refresh_hz: 60,
             is_primary: true,
+            origin_x: 0,
+            origin_y: 0,
+            logical_width: 1920,
+            logical_height: 1080,
         }])
     }
 
@@ -172,10 +176,10 @@ mod backend {
 
     use objc2_core_foundation::{CFDictionary, CFRetained, CFType};
     use objc2_core_video::{
-        CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
-        CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
-        kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey,
-        kCVPixelFormatType_32BGRA,
+        CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddress,
+        CVPixelBufferGetBytesPerRow, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
+        CVPixelBufferUnlockBaseAddress, kCVPixelBufferIOSurfacePropertiesKey,
+        kCVPixelBufferMetalCompatibilityKey, kCVPixelFormatType_32BGRA,
     };
 
     use crate::macos::PixelSurface;
@@ -213,13 +217,14 @@ mod backend {
             let stride = CVPixelBufferGetBytesPerRow(buffer);
             if base.is_null() {
                 unsafe { CVPixelBufferUnlockBaseAddress(buffer, flags) };
-                return Err(CaptureError::Platform("pixel buffer không có địa chỉ".into()));
+                return Err(CaptureError::Platform(
+                    "pixel buffer không có địa chỉ".into(),
+                ));
             }
 
             // An toàn: buffer đang bị khoá nên hệ thống không đụng tới, và
             // `stride * height` đúng bằng vùng CoreVideo cấp cho ảnh BGRA.
-            let pixels =
-                unsafe { std::slice::from_raw_parts_mut(base, stride * height as usize) };
+            let pixels = unsafe { std::slice::from_raw_parts_mut(base, stride * height as usize) };
             super::paint(pixels, stride, width, height, index as u32);
 
             unsafe { CVPixelBufferUnlockBaseAddress(buffer, flags) };
@@ -231,10 +236,9 @@ mod backend {
     fn make_pixel_buffer(width: u32, height: u32) -> Result<CFRetained<CVPixelBuffer>> {
         let empty: CFRetained<CFDictionary<CFType, CFType>> = CFDictionary::from_slices(&[], &[]);
         let yes = objc2_core_foundation::CFBoolean::new(true);
-        let keys: [&CFType; 2] = [
-            unsafe { kCVPixelBufferIOSurfacePropertiesKey },
-            unsafe { kCVPixelBufferMetalCompatibilityKey },
-        ];
+        let keys: [&CFType; 2] = [unsafe { kCVPixelBufferIOSurfacePropertiesKey }, unsafe {
+            kCVPixelBufferMetalCompatibilityKey
+        }];
         let values: [&CFType; 2] = [&empty, yes];
         let attributes = CFDictionary::from_slices(&keys, &values);
         // Hàm C nhận CFDictionary không tham số kiểu; cả hai là cùng một struct rỗng.
@@ -333,7 +337,12 @@ mod backend {
             })
         }
 
-        pub(super) fn produce(&mut self, index: u64, width: u32, height: u32) -> Result<D3dSurface> {
+        pub(super) fn produce(
+            &mut self,
+            index: u64,
+            width: u32,
+            height: u32,
+        ) -> Result<D3dSurface> {
             super::paint(&mut self.scratch, self.stride, width, height, index as u32);
 
             let texture = &self.textures[index as usize % self.textures.len()];

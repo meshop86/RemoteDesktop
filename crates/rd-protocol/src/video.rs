@@ -22,6 +22,10 @@ use bytes::Bytes;
 use crate::{MAX_VIDEO_PAYLOAD, ProtocolError, Result, control::Codec};
 
 pub const VIDEO_HEADER_LEN: usize = 20;
+
+/// Trần số mảnh của một frame. Với MTU thường, đây đã là frame ~9 MB — lớn hơn
+/// mọi keyframe thực tế, nên chỉ những header bịa mới chạm tới.
+pub const MAX_FRAME_FRAGMENTS: usize = 8192;
 pub const PACKET_KIND_VIDEO: u8 = 0x01;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -79,6 +83,19 @@ impl VideoHeader {
             fragment_count: u16::from_le_bytes(buf[10..12].try_into().unwrap()),
             capture_us: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
         };
+        // Chặn ngay ở cửa chứ không để bộ ghép tin: `fragment_count` là số của
+        // người lạ gửi tới, mà bộ ghép lấy nó ra cấp phát mảng. Số mảnh hợp lệ
+        // luôn nhỏ hơn nhiều lần MAX_FRAME_FRAGMENTS, nên đây không phải giới
+        // hạn với frame thật.
+        if header.fragment_count == 0
+            || header.fragment_count as usize > MAX_FRAME_FRAGMENTS
+            || header.fragment_idx >= header.fragment_count
+        {
+            return Err(ProtocolError::BadFragmenting {
+                idx: header.fragment_idx,
+                count: header.fragment_count,
+            });
+        }
         Ok((header, &buf[VIDEO_HEADER_LEN..]))
     }
 }
@@ -87,6 +104,11 @@ impl VideoHeader {
 ///
 /// Trả về vector các gói đã gắn header sẵn, gửi thẳng qua QUIC datagram được.
 /// Frame rỗng vẫn sinh đúng một gói để phía nhận biết frame tồn tại.
+///
+/// `max_payload` là chỗ còn lại cho *dữ liệu* trong một datagram, tức đã trừ
+/// header video. Bên gọi lấy nó từ chính kết nối QUIC chứ không đoán: đường đi
+/// qua Tailscale chỉ chứa được gói nhỏ hơn hẳn đường Ethernet thường, mà gói
+/// vượt cỡ thì QUIC từ chối gửi — im lặng mất cả frame.
 pub fn fragment_frame(
     encoded: &[u8],
     frame_id: u32,
@@ -94,8 +116,9 @@ pub fn fragment_frame(
     codec: Codec,
     keyframe: bool,
     capture_us: u64,
+    max_payload: usize,
 ) -> Vec<Bytes> {
-    let chunk_size = MAX_VIDEO_PAYLOAD;
+    let chunk_size = max_payload.clamp(1, MAX_VIDEO_PAYLOAD);
     let fragment_count = encoded.len().div_ceil(chunk_size).max(1);
 
     // Quá 65535 fragment nghĩa là frame > 77MB, không thể xảy ra với video thật.
@@ -104,7 +127,10 @@ pub fn fragment_frame(
     let mut packets = Vec::with_capacity(fragment_count);
     for (idx, chunk) in encoded
         .chunks(chunk_size)
-        .chain(std::iter::repeat_n(&[][..], usize::from(encoded.is_empty())))
+        .chain(std::iter::repeat_n(
+            &[][..],
+            usize::from(encoded.is_empty()),
+        ))
         .enumerate()
     {
         let mut flags = 0u8;
@@ -159,7 +185,7 @@ mod tests {
     #[test]
     fn fragment_covers_whole_frame() {
         let payload: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
-        let packets = fragment_frame(&payload, 42, 0, Codec::H264, true, 999);
+        let packets = fragment_frame(&payload, 42, 0, Codec::H264, true, 999, MAX_VIDEO_PAYLOAD);
         assert_eq!(packets.len(), payload.len().div_ceil(MAX_VIDEO_PAYLOAD));
 
         let mut rebuilt = Vec::new();
@@ -183,7 +209,7 @@ mod tests {
 
     #[test]
     fn empty_frame_still_produces_one_packet() {
-        let packets = fragment_frame(&[], 1, 0, Codec::Av1, false, 0);
+        let packets = fragment_frame(&[], 1, 0, Codec::Av1, false, 0, MAX_VIDEO_PAYLOAD);
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].len(), VIDEO_HEADER_LEN);
     }

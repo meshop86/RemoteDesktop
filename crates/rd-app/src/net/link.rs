@@ -45,6 +45,8 @@ pub enum Incoming {
     Offer(FileOffer),
     Accept(u64),
     Reject(u64),
+    /// Đầu kia đổi ý: bỏ lời mời chưa trả lời, hoặc cắt giữa chừng.
+    Cancel(u64),
     Ack(FileChunkAck),
     /// Chỉ host nhận được.
     Input(InputEvent),
@@ -52,6 +54,8 @@ pub enum Incoming {
     Keyframe,
     /// Chỉ host nhận được.
     Quality(QualityRequest),
+    /// Chỉ host nhận được: viewer xin đổi sang màn hình khác.
+    Monitor(u8),
     /// Chỉ host nhận được.
     Ping {
         sent_us: u64,
@@ -87,6 +91,7 @@ pub trait Wire: Send + Sync + 'static {
     fn offer(offer: FileOffer) -> Self::Out;
     fn accept(transfer_id: u64) -> Self::Out;
     fn reject(transfer_id: u64) -> Self::Out;
+    fn cancel(transfer_id: u64) -> Self::Out;
     fn ack(ack: FileChunkAck) -> Self::Out;
 
     /// `None` nghĩa là chiều này không có thông điệp tương ứng — ví dụ host
@@ -94,6 +99,8 @@ pub trait Wire: Send + Sync + 'static {
     fn input(event: InputEvent) -> Option<Self::Out>;
     fn keyframe() -> Option<Self::Out>;
     fn quality(request: QualityRequest) -> Option<Self::Out>;
+    /// Chỉ viewer gửi được: xin host đổi màn hình.
+    fn select_monitor(monitor: u8) -> Option<Self::Out>;
     fn ping(sent_us: u64) -> Option<Self::Out>;
     fn pong(sent_us: u64, host_us: u64) -> Option<Self::Out>;
 
@@ -109,6 +116,9 @@ pub struct Hooks {
     pub keyframe: Option<Arc<AtomicBool>>,
     /// Host: bitrate mới viewer yêu cầu; 0 nghĩa là chưa có yêu cầu nào.
     pub bitrate: Option<Arc<AtomicU32>>,
+    /// Host: chỉ số màn hình viewer đang muốn xem. Luồng mã hoá và luồng bơm
+    /// chuột cùng đọc ô này, đổi số là cả hai chuyển theo.
+    pub monitor: Option<Arc<AtomicU32>>,
     /// Viewer: đồng hồ đã hiệu chỉnh theo host, để tính độ trễ một chiều.
     pub clock: Option<Arc<Mutex<ClockSync>>>,
 }
@@ -124,6 +134,11 @@ pub struct Link<W: Wire> {
     offered_in: Mutex<HashMap<u64, FileOffer>>,
     /// Đã bấm nhận, đang chờ stream dữ liệu tới.
     accepted_in: Mutex<HashMap<u64, FileOffer>>,
+    /// Tay cầm của các task đang thật sự bơm dữ liệu, để cắt được giữa chừng.
+    ///
+    /// Cả hai chiều nằm chung một sổ: số hiệu đã chia đôi không gian nên không
+    /// đụng nhau, mà người bấm huỷ thì không quan tâm mình đang gửi hay nhận.
+    running: Arc<Mutex<HashMap<u64, tokio::task::AbortHandle>>>,
     counter: AtomicU64,
 }
 
@@ -158,6 +173,7 @@ pub async fn run<W: Wire>(
         pending_out: Mutex::new(HashMap::new()),
         offered_in: Mutex::new(HashMap::new()),
         accepted_in: Mutex::new(HashMap::new()),
+        running: Arc::new(Mutex::new(HashMap::new())),
         counter: AtomicU64::new(0),
     });
 
@@ -206,14 +222,21 @@ async fn read_loop<W: Wire>(
         match W::classify(message) {
             Incoming::Chat(message) => link.emit(NetEvent::Chat(message)),
             Incoming::Clipboard(text) => {
-                tracing::debug!(len = text.len(), "nhận clipboard từ máy kia");
-                link.emit(NetEvent::Clipboard(text));
+                tracing::info!(len = text.len(), "nhận clipboard từ máy kia");
+                // Ghi thẳng vào clipboard máy này, không qua giao diện: cửa sổ
+                // đang thu nhỏ thì luồng vẽ không chạy, mà dán được ngay mới là
+                // điều người dùng chờ.
+                link.ctx.config.clipboard.set(text);
             }
             Incoming::Offer(offer) => on_offer(&link, offer),
             Incoming::Accept(id) => on_accept(&link, id),
             Incoming::Reject(id) => {
                 link.pending_out.lock().expect("khoá lời mời").remove(&id);
                 link.emit(NetEvent::TransferRejected(id));
+            }
+            Incoming::Cancel(id) => {
+                huy_tai_cho(&link, id);
+                link.emit(NetEvent::TransferCancelled { id, by_peer: true });
             }
             Incoming::Ack(ack) => link.emit(NetEvent::TransferProgress {
                 id: ack.transfer_id,
@@ -229,6 +252,11 @@ async fn read_loop<W: Wire>(
             Incoming::Keyframe => {
                 if let Some(flag) = &link.hooks.keyframe {
                     flag.store(true, Ordering::Relaxed);
+                }
+            }
+            Incoming::Monitor(id) => {
+                if let Some(slot) = &link.hooks.monitor {
+                    slot.store(id as u32, Ordering::Relaxed);
                 }
             }
             Incoming::Quality(request) => {
@@ -277,7 +305,8 @@ fn on_offer<W: Wire>(link: &Arc<Link<W>>, offer: FileOffer) {
 }
 
 fn on_accept<W: Wire>(link: &Arc<Link<W>>, id: u64) {
-    let Some((offer, path)) = link.pending_out.lock().expect("khoá lời mời").remove(&id) else {
+    let Some((offer, path)) = link.pending_out.lock().expect("khoá lời mời").remove(&id)
+    else {
         tracing::warn!(id, "nhận FileAccept cho lời mời không còn tồn tại");
         return;
     };
@@ -285,7 +314,8 @@ fn on_accept<W: Wire>(link: &Arc<Link<W>>, id: u64) {
 
     let session = link.session.clone();
     let events = link.ctx.events.clone();
-    tokio::spawn(async move {
+    let running = link.running.clone();
+    let task = tokio::spawn(async move {
         // Tiến độ ở đây là số byte đã đẩy vào stream, luôn chạy trước thực tế.
         // Thanh tiến độ dùng ack của đầu kia, nên chỗ này bỏ trống.
         match rd_transport::send_file(&session, &offer, &path, |_| {}).await {
@@ -295,6 +325,35 @@ fn on_accept<W: Wire>(link: &Arc<Link<W>>, id: u64) {
                 reason: err.to_string(),
             }),
         }
+        // Xong rồi thì gạch tên khỏi sổ, kẻo phiên chạy cả ngày là sổ dài mãi.
+        running.lock().expect("khoá sổ task").remove(&id);
+    });
+    link.running
+        .lock()
+        .expect("khoá sổ task")
+        .insert(id, task.abort_handle());
+}
+
+/// Cắt một lần truyền ngay tại máy này và dọn sạch dấu vết của nó.
+///
+/// Dùng chung cho cả hai lối vào: người ở đây bấm huỷ, và đầu kia báo đã huỷ.
+/// Cắt task đang bơm là đủ để QUIC đóng stream — bên kia thấy stream đứt ngay
+/// chứ không phải chờ hết file.
+fn huy_tai_cho<W: Wire>(link: &Arc<Link<W>>, id: u64) {
+    link.pending_out.lock().expect("khoá lời mời").remove(&id);
+    link.offered_in.lock().expect("khoá lời mời").remove(&id);
+    link.accepted_in.lock().expect("khoá lời mời").remove(&id);
+
+    let Some(task) = link.running.lock().expect("khoá sổ task").remove(&id) else {
+        return;
+    };
+    task.abort();
+    // Task bị cắt giữa hai lần `await` nên đoạn dọn dẹp trong `recv_file`
+    // không chạy: file dở dang nằm lại trong thư mục tải về. Chiều gửi thì
+    // không có file tạm nào, xoá hụt cũng không sao.
+    let partial = rd_transport::partial_path(&link.ctx.config.download_dir, id);
+    tokio::spawn(async move {
+        tokio::fs::remove_file(partial).await.ok();
     });
 }
 
@@ -315,8 +374,9 @@ async fn uni_loop<W: Wire>(link: Arc<Link<W>>) -> anyhow::Result<()> {
         let events = link.ctx.events.clone();
         let outbox = link.outbox.clone();
         let dir = link.ctx.config.download_dir.clone();
+        let running = link.running.clone();
         let size = offer.size;
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut acked = 0u64;
             let result = rd_transport::recv_file(stream, &offer, &dir, |done| {
                 events.send(NetEvent::TransferProgress { id, done });
@@ -337,7 +397,12 @@ async fn uni_loop<W: Wire>(link: Arc<Link<W>>) -> anyhow::Result<()> {
                     reason: err.to_string(),
                 }),
             }
+            running.lock().expect("khoá sổ task").remove(&id);
         });
+        link.running
+            .lock()
+            .expect("khoá sổ task")
+            .insert(id, task.abort_handle());
     }
 }
 
@@ -393,12 +458,24 @@ async fn command_loop<W: Wire>(
                     link.send(W::accept(id));
                 }
             }
+            UiCommand::CancelFile(id) => {
+                // Báo trước rồi mới cắt: cắt trước thì đầu kia thấy stream đứt
+                // và báo "lỗi" đúng một nhịp trước khi biết đó là do đổi ý.
+                link.send(W::cancel(id));
+                huy_tai_cho(&link, id);
+                link.emit(NetEvent::TransferCancelled { id, by_peer: false });
+            }
             UiCommand::RejectFile(id) => {
                 link.offered_in.lock().expect("khoá lời mời").remove(&id);
                 link.send(W::reject(id));
             }
             UiCommand::RequestKeyframe => {
                 if let Some(message) = W::keyframe() {
+                    link.send(message);
+                }
+            }
+            UiCommand::SelectMonitor(id) => {
+                if let Some(message) = W::select_monitor(id) {
                     link.send(message);
                 }
             }

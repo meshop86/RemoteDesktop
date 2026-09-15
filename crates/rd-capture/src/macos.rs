@@ -20,7 +20,9 @@ use objc2::{AllocAnyThread, DefinedClass, define_class, msg_send};
 use objc2_core_foundation::CFRetained;
 use objc2_core_media::{CMSampleBuffer, CMTime, CMTimeFlags};
 use objc2_core_video::{CVPixelBuffer, CVPixelBufferGetHeight, CVPixelBufferGetWidth};
-use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString};
+use objc2_foundation::{
+    NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString,
+};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration,
     SCStreamDelegate, SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType, SCWindow,
@@ -175,25 +177,31 @@ fn classify_error(code: isize, message: String) -> CaptureError {
 }
 
 fn shareable_content(timeout: Duration) -> Result<Retained<SCShareableContent>> {
-    let (tx, rx) =
-        std::sync::mpsc::channel::<std::result::Result<SendRetained<SCShareableContent>, (isize, String)>>();
-    let handler = RcBlock::new(move |content: *mut SCShareableContent, error: *mut NSError| {
-        let result = if content.is_null() {
-            let detail = if error.is_null() {
-                (0, "ScreenCaptureKit không trả về nội dung".to_string())
+    let (tx, rx) = std::sync::mpsc::channel::<
+        std::result::Result<SendRetained<SCShareableContent>, (isize, String)>,
+    >();
+    let handler = RcBlock::new(
+        move |content: *mut SCShareableContent, error: *mut NSError| {
+            let result = if content.is_null() {
+                let detail = if error.is_null() {
+                    (0, "ScreenCaptureKit không trả về nội dung".to_string())
+                } else {
+                    let error = unsafe { &*error };
+                    (error.code(), error.localizedDescription().to_string())
+                };
+                Err(detail)
             } else {
-                let error = unsafe { &*error };
-                (error.code(), error.localizedDescription().to_string())
+                match unsafe { Retained::retain(content) } {
+                    Some(retained) => Ok(SendRetained(retained)),
+                    None => Err((
+                        0,
+                        "không giữ được tham chiếu SCShareableContent".to_string(),
+                    )),
+                }
             };
-            Err(detail)
-        } else {
-            match unsafe { Retained::retain(content) } {
-                Some(retained) => Ok(SendRetained(retained)),
-                None => Err((0, "không giữ được tham chiếu SCShareableContent".to_string())),
-            }
-        };
-        let _ = tx.send(result);
-    });
+            let _ = tx.send(result);
+        },
+    );
 
     unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
 
@@ -245,6 +253,9 @@ impl ScreenCapturer for MacScreenCapturer {
             // pixel thật, nếu không sẽ capture ở nửa độ phân giải trên máy Retina.
             let scale = unsafe { filter.pointPixelScale() };
             let rect = unsafe { filter.contentRect() };
+            // Chuột trên macOS đi theo point trong hệ toạ độ chung của tất cả
+            // màn hình, nên lấy thẳng từ CoreGraphics thay vì suy từ contentRect.
+            let bounds = objc2_core_graphics::CGDisplayBounds(display_id);
             out.push(DisplayInfo {
                 id: display_id,
                 name: format!("Display {}", index + 1),
@@ -253,6 +264,10 @@ impl ScreenCapturer for MacScreenCapturer {
                 scale,
                 refresh_hz: 60,
                 is_primary: index == 0,
+                origin_x: bounds.origin.x.round() as i32,
+                origin_y: bounds.origin.y.round() as i32,
+                logical_width: bounds.size.width.round() as u32,
+                logical_height: bounds.size.height.round() as u32,
             });
         }
         if out.is_empty() {
@@ -359,14 +374,22 @@ impl ScreenCapturer for MacScreenCapturer {
             stream,
             _output: output,
             slot,
-            display: DisplayInfo {
-                id: unsafe { display.displayID() },
-                name: "Display".to_string(),
-                width,
-                height,
-                scale,
-                refresh_hz: config.target_fps,
-                is_primary: true,
+            display: {
+                let id = unsafe { display.displayID() };
+                let bounds = objc2_core_graphics::CGDisplayBounds(id);
+                DisplayInfo {
+                    id,
+                    name: "Display".to_string(),
+                    width,
+                    height,
+                    scale,
+                    refresh_hz: config.target_fps,
+                    is_primary: true,
+                    origin_x: bounds.origin.x.round() as i32,
+                    origin_y: bounds.origin.y.round() as i32,
+                    logical_width: bounds.size.width.round() as u32,
+                    logical_height: bounds.size.height.round() as u32,
+                }
             },
             running: true,
         })

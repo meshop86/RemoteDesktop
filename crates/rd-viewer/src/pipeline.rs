@@ -27,10 +27,10 @@ use rd_codec::{
     PlatformDecoder, PlatformEncoder,
 };
 
-#[cfg(target_os = "macos")]
-use rd_codec::videotoolbox::DecodedFrame;
 #[cfg(target_os = "windows")]
 use rd_codec::mediafoundation::DecodedFrame;
+#[cfg(target_os = "macos")]
+use rd_codec::videotoolbox::DecodedFrame;
 
 /// Một frame đã đi hết chặng, kèm số liệu của từng chặng.
 pub struct PipelineFrame {
@@ -53,6 +53,8 @@ pub struct PipelineFrame {
 #[derive(Debug, Clone)]
 pub struct PipelineInfo {
     pub source: String,
+    /// Màn hình đang chụp, theo `id` mà `rd_capture::list_displays` trả về.
+    pub display_id: u32,
     pub width: u32,
     pub height: u32,
     pub codec: Codec,
@@ -116,6 +118,7 @@ impl EncodeSource {
     /// `viewer_codecs` cũng vậy: codec phải chốt *trước* khi dựng bộ mã hoá, và
     /// chốt theo khả năng của cả hai đầu.
     pub fn start(
+        display_id: u32,
         target_fps: u32,
         bitrate_kbps: u32,
         allow_10bit: bool,
@@ -123,6 +126,7 @@ impl EncodeSource {
     ) -> anyhow::Result<Self> {
         let codec = pick_codec(viewer_codecs)?;
         let capture_config = CaptureConfig {
+            display_id,
             target_fps,
             ..Default::default()
         };
@@ -153,6 +157,7 @@ impl EncodeSource {
 
         let info = PipelineInfo {
             source: source_name,
+            display_id,
             width,
             height,
             codec,
@@ -416,8 +421,13 @@ pub struct Pipeline {
 impl Pipeline {
     pub fn start(target_fps: u32, bitrate_kbps: u32, allow_10bit: bool) -> anyhow::Result<Self> {
         // Người xem ở đây chính là máy này, nên khả năng giải mã cũng là của nó.
-        let mut encoder =
-            EncodeSource::start(target_fps, bitrate_kbps, allow_10bit, &rd_codec::decodable())?;
+        let mut encoder = EncodeSource::start(
+            0,
+            target_fps,
+            bitrate_kbps,
+            allow_10bit,
+            &rd_codec::decodable(),
+        )?;
         let info = encoder.info().clone();
 
         #[cfg(target_os = "macos")]
