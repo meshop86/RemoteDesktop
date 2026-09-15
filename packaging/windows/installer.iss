@@ -33,8 +33,8 @@ WizardStyle=modern
 ; SmartScreen và phần mềm diệt virus nghi ngờ. Đường dẫn tính từ file .iss này.
 SetupIconFile=..\icon.ico
 UninstallDisplayIcon={app}\remote-desktop.exe
-AppPublisherURL=https://github.com/meshop86/RemoteDesktop
-AppSupportURL=https://github.com/meshop86/RemoteDesktop/issues
+AppPublisherURL=https://chiphoc.com/remote-desktop
+AppSupportURL=https://chiphoc.com/remote-desktop
 VersionInfoDescription=Bộ cài Remote Desktop
 VersionInfoProductName=Remote Desktop
 VersionInfoCompany=Luong Xuan Hoa

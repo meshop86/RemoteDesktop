@@ -131,6 +131,7 @@ Không tham số nào là bắt buộc; chúng chỉ điền sẵn màn hình đ
     --trust-tailnet        máy cùng tài khoản Tailscale vào thẳng, khỏi mật khẩu
     --probe                in khả năng của máy này rồi thoát
     --tu-kiem              tự kiểm clipboard và mục tự khởi động rồi thoát
+    --tu-khoi-dong on|off  bật/tắt tự mở lại khi đăng nhập rồi thoát (bộ cài gọi)
     --screenshot TỆP       chụp cửa sổ ra tệp .ppm rồi thoát (dùng khi sửa giao diện)
                            thêm cai-dat: trước đường dẫn để chụp trang cài đặt
     -h, --help             in bảng này
@@ -150,6 +151,10 @@ pub struct Args {
     /// đây là macOS nên hai thứ ấy chỉ máy Windows thật mới trả lời được — cờ
     /// này gói cả ba phép thử vào một lệnh để người dùng chạy hộ.
     pub selftest: bool,
+    /// Đăng ký (hoặc gỡ) mục tự khởi động rồi thoát, không mở cửa sổ. Bộ cài
+    /// gọi cờ này ngay sau khi chép tệp: lúc ấy nó đang có quyền quản trị nên
+    /// đăng ký được việc đã hẹn, thứ mà chương trình chạy thường không làm nổi.
+    pub tu_khoi_dong: Option<bool>,
     pub host: bool,
     /// Chạy ngầm: cửa sổ thu nhỏ sẵn, vào thẳng chế độ chia sẻ. Dùng cho lần tự
     /// khởi động sau khi máy có điện lại.
@@ -177,6 +182,7 @@ impl Default for Args {
             trust_tailnet: false,
             probe: false,
             selftest: false,
+            tu_khoi_dong: None,
             host: false,
             background: false,
             connect: None,
@@ -215,6 +221,17 @@ impl Args {
                 "--trust-tailnet" => out.trust_tailnet = true,
                 "--probe" => out.probe = true,
                 "--tu-kiem" | "--selftest" => out.selftest = true,
+                "--tu-khoi-dong" => {
+                    out.tu_khoi_dong = match value()?.as_str() {
+                        "on" | "1" | "bat" => Some(true),
+                        "off" | "0" | "tat" => Some(false),
+                        other => {
+                            return Err(format!(
+                                "--tu-khoi-dong nhận on hoặc off, không nhận {other}"
+                            ));
+                        }
+                    }
+                }
                 "--host" => out.host = true,
                 "--background" => {
                     out.background = true;
@@ -367,6 +384,8 @@ struct Form {
     /// Cho máy cùng tài khoản Tailscale vào thẳng, khỏi mật khẩu.
     trust_tailnet: bool,
     prefs: Prefs,
+    /// Chỗ ô thao tác nhanh đang đứng, nhớ giữa hai lần chạy.
+    o_nhanh_goc: Option<(f32, f32)>,
     recents: Vec<RecentPeer>,
 }
 
@@ -433,7 +452,9 @@ impl Form {
                 hide_chrome: saved.hide_chrome.unwrap_or(mac_dinh.hide_chrome),
                 show_hud: saved.show_hud.unwrap_or(mac_dinh.show_hud),
                 auto_reconnect: saved.auto_reconnect.unwrap_or(mac_dinh.auto_reconnect),
+                o_nhanh: saved.o_nhanh.unwrap_or(mac_dinh.o_nhanh),
             },
+            o_nhanh_goc: saved.o_nhanh_goc,
         }
     }
 
@@ -456,6 +477,8 @@ impl Form {
             hide_chrome: Some(self.prefs.hide_chrome),
             show_hud: Some(self.prefs.show_hud),
             auto_reconnect: Some(self.prefs.auto_reconnect),
+            o_nhanh: Some(self.prefs.o_nhanh),
+            o_nhanh_goc: self.o_nhanh_goc,
             recents: Some(self.recents.clone()),
         }
         .save();
@@ -538,6 +561,8 @@ pub struct Prefs {
     pub show_hud: bool,
     /// Mất kết nối thì tự nối lại thay vì bỏ phiên.
     pub auto_reconnect: bool,
+    /// Hiện ô thao tác nhanh nổi trên mọi cửa sổ khi đã nối.
+    pub o_nhanh: bool,
 }
 
 impl Default for Prefs {
@@ -554,6 +579,8 @@ impl Default for Prefs {
             // Bật sẵn: máy kia mất điện, rớt wifi hay ngủ màn hình là chuyện
             // thường ngày, và phiên phải sống qua được những lần đó.
             auto_reconnect: true,
+            // Bật sẵn: cả điểm hay của nó nằm ở chỗ không phải bật.
+            o_nhanh: true,
         }
     }
 }
@@ -581,6 +608,9 @@ struct Settings {
     hide_chrome: Option<bool>,
     show_hud: Option<bool>,
     auto_reconnect: Option<bool>,
+    o_nhanh: Option<bool>,
+    /// Chỗ người dùng để ô thao tác nhanh lần trước.
+    o_nhanh_goc: Option<(f32, f32)>,
     recents: Option<Vec<RecentPeer>>,
 }
 
@@ -674,6 +704,8 @@ pub struct RdApp {
     start_height: f32,
     /// Chiều cao thẻ cao nhất ở lượt vẽ trước, để hai thẻ bằng nhau.
     card_height: f32,
+    /// Ô thao tác nhanh: cửa sổ tí hon nổi trên mọi cửa sổ khác khi đã nối.
+    quick: crate::quick::Bang,
 }
 
 /// Cổng đã dùng lần trước khi nối tới đúng địa chỉ này.
@@ -746,6 +778,7 @@ impl RdApp {
         apply_style(&cc.egui_ctx);
 
         let form = Form::from_args(&args);
+        let form_goc = form.o_nhanh_goc;
         let mut app = Self {
             screen: if args.screenshot_settings {
                 Screen::Settings
@@ -764,6 +797,7 @@ impl RdApp {
             loc_may: String::new(),
             start_height: 0.0,
             card_height: 0.0,
+            quick: crate::quick::Bang::moi(form_goc.map(|(x, y)| egui::pos2(x, y))),
             // Thu nhỏ ở khung vẽ đầu tiên chứ không phải ngay đây: cửa sổ chưa
             // tồn tại thì lệnh gửi đi rơi vào hư không.
             minimize: args.background,
@@ -805,7 +839,7 @@ impl RdApp {
             .then_some(snapshot.self_ip)
             .flatten()
             .or_else(dia_chi_tailnet);
-        match SessionState::start(config, tailscale_ip, self.form.prefs) {
+        match SessionState::start(config, tailscale_ip, self.form.prefs, self.quick.clone()) {
             Ok(state) => {
                 self.error = None;
                 self.screen = Screen::Session(Box::new(state));
@@ -1432,6 +1466,15 @@ impl RdApp {
                             "Máy kia rớt mạng, ngủ màn hình hay mất điện: phiên chờ và tự nối \
                          lại khi máy kia quay lại, thay vì bắt bấm lại từ đầu.",
                         );
+                        ui.checkbox(
+                            &mut self.form.prefs.o_nhanh,
+                            "Hiện ô thao tác nhanh khi đã nối",
+                        )
+                        .on_hover_text(
+                            "Một ô nhỏ luôn nổi trên mọi cửa sổ khác. Kéo tệp thả vào đó là tệp \
+                         đi ngay, không phải mở lại cửa sổ này. Bấm đúp vào ô để mở cửa sổ \
+                         chính, kéo ô để dời nó đi chỗ khác.",
+                        );
                     });
 
                     ui.add_space(10.0);
@@ -1546,6 +1589,38 @@ impl RdApp {
 const SCREENSHOT_DELAY: u32 = 12;
 
 impl RdApp {
+    /// Quyết định lúc nào ô thao tác nhanh hiện ra, và nuôi nó bằng tin mới.
+    ///
+    /// Hai lúc cần nó: vừa nối xong (để biết kết nối sống và ném tệp qua lại),
+    /// và lúc cửa sổ chính thu xuống thanh tác vụ — lúc ấy nó là thứ duy nhất
+    /// còn nhìn thấy được của phần mềm.
+    ///
+    /// Ô là một cửa sổ con của egui, mà cửa sổ con còn sống thì eframe vẫn cho
+    /// cửa sổ chính chạy tiếp vòng vẽ dù nó đang thu nhỏ — nhờ vậy tiến độ tệp
+    /// và trạng thái trong ô vẫn nhúc nhích.
+    fn tick_o_nhanh(&mut self, ctx: &egui::Context) {
+        let Screen::Session(state) = &self.screen else {
+            crate::quick::dong(&self.quick);
+            return;
+        };
+        let tin = state.tin_nhanh();
+        let thu_nho = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        let hien = self.form.prefs.o_nhanh && !self.quick.tat_roi() && (tin.noi || thu_nho);
+        self.quick.cap_nhat(tin);
+        if hien {
+            crate::quick::ve(ctx, &self.quick);
+        } else {
+            crate::quick::dong(&self.quick);
+        }
+        // Người dùng vừa kéo ô sang chỗ khác thì nhớ lấy, lần chạy sau mở đúng
+        // đó. `vi_tri_moi` chỉ trả về khi thật sự có thay đổi nên không biến
+        // mỗi lượt vẽ thành một lần ghi đĩa.
+        if let Some(goc) = self.quick.vi_tri_moi() {
+            self.form.o_nhanh_goc = Some((goc.x, goc.y));
+            self.form.save();
+        }
+    }
+
     /// Đếm khung, chụp, ghi tệp rồi đóng cửa sổ — chỉ chạy khi có `--screenshot`.
     fn tick_screenshot(&mut self, ctx: &egui::Context) {
         let Some((path, frames)) = &mut self.screenshot else {
@@ -1621,6 +1696,7 @@ impl eframe::App for RdApp {
             Screen::Session(state) => matches!(state.update(ui), Outcome::Leave),
             Screen::Local(state) => state.update(ui),
         };
+        self.tick_o_nhanh(ui.ctx());
         self.tick_screenshot(ui.ctx());
         if leave {
             // Tên máy kia chỉ biết được sau khi nối; ghi lại lúc rời phiên để
@@ -1643,6 +1719,7 @@ impl eframe::App for RdApp {
             // Thả `SessionState` ở đây là dừng luồng mạng và đóng kết nối; màn
             // hình đầu phải sạch để bấm nối lại được ngay.
             self.screen = Screen::Start;
+            self.quick.roi_phien();
             // Phiên có thể đã bung toàn màn hình; về màn hình đầu mà cửa sổ
             // vẫn phủ kín thì không còn nút nào để thu nó lại.
             ui.ctx()
@@ -1857,6 +1934,21 @@ mod tests {
         let args = Args::parse(["--background".to_string()].into_iter()).expect("đọc tham số");
         assert!(args.background);
         assert!(args.host);
+    }
+
+    /// Bộ cài gọi đúng cờ này để đăng ký mục tự khởi động. Đổi tên hay đổi
+    /// cách nhận giá trị là bộ cài chạy xong nhưng máy không tự lên.
+    #[test]
+    fn co_tu_khoi_dong_nhan_on_va_off() {
+        let bat = Args::parse(["--tu-khoi-dong".to_string(), "on".to_string()].into_iter())
+            .expect("đọc tham số");
+        assert_eq!(bat.tu_khoi_dong, Some(true));
+        let tat = Args::parse(["--tu-khoi-dong".to_string(), "off".to_string()].into_iter())
+            .expect("đọc tham số");
+        assert_eq!(tat.tu_khoi_dong, Some(false));
+        assert!(Args::parse(["--tu-khoi-dong".to_string(), "co".to_string()].into_iter()).is_err());
+        assert!(Args::parse(["--tu-khoi-dong".to_string()].into_iter()).is_err());
+        assert_eq!(Args::default().tu_khoi_dong, None);
     }
 
     /// Mỗi máy đặt cổng riêng được, nên bấm vào một máy trong danh sách phải

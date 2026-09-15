@@ -30,6 +30,7 @@ mod app;
 mod net;
 mod os;
 mod probe;
+mod quick;
 mod session;
 mod tailscale;
 mod ui;
@@ -243,6 +244,23 @@ fn main() {
         println!("{}", app::probe());
         return;
     }
+    if let Some(bat) = args.tu_khoi_dong {
+        match os::set_autostart(bat) {
+            Ok(()) => println!(
+                "{}",
+                if bat {
+                    "đã đăng ký tự mở lại khi đăng nhập"
+                } else {
+                    "đã gỡ mục tự mở lại"
+                }
+            ),
+            Err(err) => {
+                eprintln!("không đặt được tự khởi động: {err}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.selftest {
         // Mã thoát khác 0 để chạy trong script cũng biết đường mà dừng.
         if !os::selftest() {
@@ -299,6 +317,7 @@ fn doc_dau() -> Vec<String> {
 }
 
 fn run(args: app::Args, tranh: Vec<String>) -> eframe::Result<()> {
+    os::cho_phep_tha_tep();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             // Vừa đủ cho màn hình đầu và trang cài đặt. Vào phiên xem màn

@@ -226,14 +226,14 @@ fn nhu_dong_lenh(_command: &mut Command) {}
 
 /// Đừng để cửa sổ console đen nhấp nháy mỗi lần hỏi trạng thái.
 #[cfg(target_os = "windows")]
-fn hide_console(command: &mut Command) {
+pub(crate) fn hide_console(command: &mut Command) {
     use std::os::windows::process::CommandExt as _;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     command.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(not(target_os = "windows"))]
-fn hide_console(_command: &mut Command) {}
+pub(crate) fn hide_console(_command: &mut Command) {}
 
 /// Hỏi Tailscale xem tình hình thế nào. Lời gọi này **chặn** — gọi trên luồng
 /// nền, đừng gọi trong lúc vẽ giao diện.

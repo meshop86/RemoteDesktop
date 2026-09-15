@@ -56,8 +56,10 @@ if (-not ($gui -and $nhan)) {
 
 "`n=== 3. Còn hai việc phải làm tay ==="
 @"
-  a) Tích ô "Tự chạy ngầm ở chế độ chia sẻ khi đăng nhập" trong Cài đặt, rồi
-     khởi động lại máy: đăng nhập xong phần mềm phải tự lên, cửa sổ thu nhỏ,
-     đã ở chế độ chia sẻ.
+  a) Tích ô "Máy bật lại là tự chia sẻ tiếp" ở thẻ chia sẻ (hoặc cài bằng bộ
+     cài, mục đó tự bật), rồi khởi động lại máy: đăng nhập xong phần mềm phải
+     tự lên, cửa sổ thu nhỏ, đã ở chế độ chia sẻ. Muốn máy mất điện bật lại là
+     chạy được ngay mà không ai gõ mật khẩu Windows thì bấm thêm nút "Bật đăng
+     nhập tự động…" ngay dưới ô ấy.
   b) Copy ở máy này, dán ở máy kia (hai máy thật, không phải hai cửa sổ).
 "@

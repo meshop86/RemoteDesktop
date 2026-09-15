@@ -103,6 +103,13 @@ const BANG_HEP: f32 = 240.0;
 const BANG_RONG_TOI_DA: f32 = 420.0;
 
 const REVEAL_EDGE: f32 = 6.0;
+/// Con trỏ phải nằm yên sát mép trên chừng này thì thanh ẩn mới hiện. Hiện tức
+/// thì là cú bấm vào tiêu đề cửa sổ bên kia rơi trúng nút của thanh vừa bung.
+const REVEAL_DWELL: Duration = Duration::from_millis(450);
+/// Bấm lần hai sớm hơn chừng này thì coi là cú bấm đúp vô tình, chưa thoát.
+const XAC_NHAN_THOAT_SOM: Duration = Duration::from_millis(600);
+/// Quá chừng này không bấm lần hai thì nút trở lại như cũ.
+const XAC_NHAN_THOAT_HAN: Duration = Duration::from_secs(4);
 
 /// Chờ bao lâu trước lần nối lại đầu tiên.
 const RECONNECT_FIRST: Duration = Duration::from_secs(2);
@@ -327,6 +334,8 @@ pub struct SessionState {
     current: Option<Arc<DecodedFrame>>,
     /// Lúc frame đang hiện được nhận. Dùng để biết hình còn sống hay đã đứng.
     current_at: Option<Instant>,
+    /// Lần gần nhất xin keyframe vì hình đứng. Giữ lại để đừng xin dồn dập.
+    xin_keyframe: Option<Instant>,
     metrics: Metrics,
 
     chat: ChatLog,
@@ -383,6 +392,15 @@ pub struct SessionState {
     fullscreen_applied: bool,
     /// Thiết lập người dùng chọn ở trang cài đặt, chốt lúc vào phiên.
     prefs: Prefs,
+    /// Ô thao tác nhanh. Phiên nuôi nó bằng tin mới và cho nó đường gửi lệnh.
+    quick: crate::quick::Bang,
+    /// Lúc bấm "Thoát phiên" lần đầu. Phải bấm thêm lần nữa mới thoát thật.
+    xac_nhan_thoat: Option<Instant>,
+    /// Lúc con trỏ bắt đầu nằm sát mép trên, để đo đã dừng ở đó đủ lâu chưa.
+    sat_mep_tu: Option<Instant>,
+    /// Thanh trên có đang hiện ở lượt vẽ trước không, và cao bao nhiêu.
+    thanh_hien: bool,
+    thanh_cao: f32,
     unread: u32,
     last_report: Instant,
 }
@@ -397,6 +415,7 @@ impl SessionState {
         mut config: NetConfig,
         tailscale_ip: Option<String>,
         prefs: Prefs,
+        quick: crate::quick::Bang,
     ) -> anyhow::Result<Self> {
         let role = config.role;
         let my_name = config.name.clone();
@@ -413,6 +432,9 @@ impl SessionState {
         if let Some(clipboard) = &clipboard {
             clipboard.forward_to(Some(forwarder(&net, &clip_sink)));
         }
+        // Ô nhanh gửi tệp thẳng xuống phần mạng: cửa sổ chính có thu nhỏ, có
+        // đứng vòng vẽ thì tệp thả vào ô vẫn đi.
+        quick.vao_phien(net.commands());
         Ok(Self {
             role,
             net,
@@ -421,6 +443,7 @@ impl SessionState {
             bitrate_kbps,
             info: None,
             current: None,
+            xin_keyframe: None,
             current_at: None,
             metrics: Metrics::default(),
             chat: ChatLog::default(),
@@ -458,6 +481,11 @@ impl SessionState {
             fullscreen: prefs.start_fullscreen,
             fullscreen_applied: false,
             prefs,
+            quick,
+            xac_nhan_thoat: None,
+            sat_mep_tu: None,
+            thanh_hien: false,
+            thanh_cao: 0.0,
             unread: 0,
             last_report: Instant::now(),
         })
@@ -466,6 +494,37 @@ impl SessionState {
     /// Tên máy kia tự khai lúc nối. `None` khi chưa nối được lần nào.
     pub fn peer_display_name(&self) -> Option<&str> {
         self.peer.as_deref()
+    }
+
+    /// Bản rút gọn của phiên cho ô thao tác nhanh: chỉ những gì vẽ vừa một ô
+    /// rộng bằng hai đốt ngón tay.
+    pub fn tin_nhanh(&self) -> crate::quick::Tin {
+        let trang_thai = if let Some(luc) = self.retry_at {
+            let cho = luc.saturating_duration_since(Instant::now());
+            format!("nối lại sau {:.0}s", cho.as_secs_f32().ceil())
+        } else if self.ended.is_some() {
+            "đã dừng".to_string()
+        } else if self.connected() {
+            String::new()
+        } else {
+            self.status.clone()
+        };
+        // Cái mới nhất còn đang chạy: ô chỉ đủ chỗ cho một dòng, mà thứ người
+        // dùng vừa thả vào mới là thứ họ đang ngóng.
+        let dang_chuyen = self
+            .transfers
+            .list()
+            .iter()
+            .rev()
+            .find(|item| matches!(item.state, TransferState::Active | TransferState::Offered))
+            .map(|item| (item.name.clone(), item.ratio()));
+        crate::quick::Tin {
+            noi: self.connected(),
+            ten: self.peer.clone().unwrap_or_default(),
+            trang_thai,
+            dang_chuyen,
+            chua_doc: self.unread,
+        }
     }
 
     pub fn update(&mut self, root: &mut egui::Ui) -> Outcome {
@@ -619,6 +678,23 @@ impl SessionState {
             }
             self.current = Some(frame.frame);
             self.current_at = Some(Instant::now());
+            self.xin_keyframe = None;
+        }
+
+        // Hình đứng lâu mà phiên vẫn sống thì xin một keyframe. Hai cớ hay gặp
+        // nhất đều được cứu bằng đúng một lời xin: chuỗi dự đoán ở bộ giải mã
+        // đứt, hoặc keyframe mở đầu của chuỗi mới bên kia rơi mất trên đường —
+        // cả hai đều để lại một tấm hình chết y hệt nhau.
+        if self.peer.is_some()
+            && self
+                .current_at
+                .is_some_and(|luc| luc.elapsed() >= STALE_AFTER)
+            && self
+                .xin_keyframe
+                .is_none_or(|luc| luc.elapsed() >= STALE_AFTER)
+        {
+            self.xin_keyframe = Some(Instant::now());
+            self.net.send(UiCommand::RequestKeyframe);
         }
     }
 
@@ -644,8 +720,10 @@ impl SessionState {
                 if let Some(clipboard) = &self.clipboard {
                     clipboard.forward_to(Some(forwarder(&net, &self.clip_sink)));
                 }
+                self.quick.doi_duong(net.commands());
                 self.net = net;
                 self.ended = None;
+                self.xin_keyframe = None;
                 self.peer = None;
                 self.info = None;
                 self.current = None;
@@ -735,6 +813,76 @@ impl SessionState {
         );
     }
 
+    /// Thanh trên đang giấu thì có nên hiện nó ra không.
+    ///
+    /// Đang điều khiển thì con trỏ lên sát mép trên là chuyện thường: tiêu đề
+    /// cửa sổ, thanh tab, menu của máy bên kia đều nằm đó. Bung thanh ngay khi
+    /// con trỏ chạm vùng ấy là cú bấm dành cho máy kia rơi trúng nút "Thoát
+    /// phiên" nằm đúng góc trái. Nên chỉ bung khi con trỏ dừng yên sát mép đủ
+    /// lâu mà không giữ nút nào, và đang điều khiển thì vùng ấy chỉ còn một dải
+    /// mỏng. Đã hiện rồi thì giữ nguyên chừng nào con trỏ còn nằm trên thanh.
+    fn thanh_can_hien(&mut self, ctx: &egui::Context, top: f32) -> bool {
+        let Some(pos) = ctx.pointer_latest_pos() else {
+            self.sat_mep_tu = None;
+            return false;
+        };
+        if self.thanh_hien
+            && pos.y >= top - REVEAL_EDGE
+            && pos.y <= top + self.thanh_cao + REVEAL_EDGE
+        {
+            return true;
+        }
+        let vung = if self.control_on {
+            REVEAL_EDGE
+        } else {
+            REVEAL_EDGE * 8.0
+        };
+        if pos.y > top + vung || pos.y < top - REVEAL_EDGE {
+            self.sat_mep_tu = None;
+            return false;
+        }
+        if ctx.input(|i| i.pointer.any_down()) {
+            self.sat_mep_tu = None;
+            return false;
+        }
+        let tu = *self.sat_mep_tu.get_or_insert_with(Instant::now);
+        if tu.elapsed() >= REVEAL_DWELL {
+            return true;
+        }
+        ctx.request_repaint_after(REVEAL_DWELL.saturating_sub(tu.elapsed()));
+        false
+    }
+
+    /// Nút rời phiên, phải bấm hai lần. Trả về true khi người dùng đã xác nhận.
+    fn nut_thoat(&mut self, ui: &mut egui::Ui) -> bool {
+        let dang_cho = self
+            .xac_nhan_thoat
+            .filter(|luc| luc.elapsed() < XAC_NHAN_THOAT_HAN);
+        self.xac_nhan_thoat = dang_cho;
+        let nut = match dang_cho {
+            Some(_) => ui.button(egui::RichText::new("Bấm lần nữa để thoát").color(ui::BAD)),
+            None => ui.button("Thoát phiên"),
+        };
+        if !nut.clicked() {
+            if let Some(luc) = dang_cho {
+                ui.ctx()
+                    .request_repaint_after(XAC_NHAN_THOAT_HAN.saturating_sub(luc.elapsed()));
+            }
+            return false;
+        }
+        match dang_cho {
+            Some(luc) if luc.elapsed() >= XAC_NHAN_THOAT_SOM => {
+                tracing::info!("người dùng thoát phiên");
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.xac_nhan_thoat = Some(Instant::now());
+                false
+            }
+        }
+    }
+
     fn peer_name(&self) -> &str {
         self.peer.as_deref().unwrap_or("đầu kia")
     }
@@ -749,21 +897,18 @@ impl SessionState {
         // Giấu thanh đi mà không có đường lấy lại thì người dùng kẹt trong một
         // cửa sổ không nút nào — đưa chuột lên sát mép trên là nó hiện.
         let top = root.max_rect().top();
-        let near_top = root
-            .ctx()
-            .pointer_latest_pos()
-            .is_some_and(|pos| pos.y <= top + REVEAL_EDGE * 8.0 && pos.y >= top - REVEAL_EDGE);
+        let near_top = self.thanh_can_hien(root.ctx(), top);
         let show_chrome = !self.hide_chrome || near_top;
 
         if show_chrome {
-            egui::Panel::top("thanh").show(root, |ui| {
+            let thanh = egui::Panel::top("thanh").show(root, |ui| {
                 // Cửa sổ hẹp thì cho nhóm nút bên phải xuống hàng riêng. Layout
                 // phải-sang-trái không biết co lại: hết chỗ là nó vẽ đè lên phần
                 // bên trái, thành một mớ chữ chồng lên nhau.
                 let mot_hang =
                     ui.available_width() >= self.be_ngang_thanh_phai() + BE_NGANG_THANH_TRAI;
                 ui.horizontal(|ui| {
-                    if ui.button("Thoát phiên").clicked() {
+                    if self.nut_thoat(ui) {
                         outcome = Outcome::Leave;
                     }
                     ui.separator();
@@ -812,7 +957,9 @@ impl SessionState {
                     ui.horizontal(|ui| self.thanh_phai(ui));
                 }
             });
+            self.thanh_cao = thanh.response.rect.height();
         }
+        self.thanh_hien = show_chrome;
 
         if self.show_panel && show_chrome {
             egui::Panel::right("bảng")
@@ -855,6 +1002,23 @@ impl SessionState {
             self.show_panel = !self.show_panel;
             if self.show_panel {
                 self.unread = 0;
+            }
+        }
+        if self.prefs.o_nhanh {
+            let hien = !self.quick.tat_roi();
+            if ui
+                .selectable_label(hien, "Ô nổi")
+                .on_hover_text(
+                    "Ô nhỏ luôn nằm trên mọi cửa sổ khác: thả tệp vào đó là gửi ngay, không \
+                     phải mở lại cửa sổ này.",
+                )
+                .clicked()
+            {
+                if hien {
+                    self.quick.tat_di();
+                } else {
+                    self.quick.bat_lai();
+                }
             }
         }
         if self.role == Role::Viewer && self.monitors.len() > 1 {
@@ -942,7 +1106,8 @@ impl SessionState {
 
     /// Ước lượng bề ngang nhóm ấy cần, để biết có nhét chung một hàng được không.
     fn be_ngang_thanh_phai(&self) -> f32 {
-        let mut can = 130.0;
+        // Chat/Tệp, và nút bật tắt ô nổi.
+        let mut can = 200.0;
         if self.role == Role::Viewer {
             // Điều khiển, keyframe, trần kbps, toàn màn hình, ẩn thanh.
             can += 540.0;
@@ -1036,6 +1201,7 @@ impl SessionState {
             // Mất focus mà còn phím đang giữ thì bên kia kẹt phím vĩnh viễn:
             // không sự kiện nhả nào tới nữa vì cửa sổ này hết nghe.
             if !ui.input(|i| i.focused) {
+                tracing::info!("cửa sổ mất focus, tắt điều khiển");
                 self.net.send(UiCommand::Input(vec![self.capture.reset()]));
                 self.control_on = false;
             }
@@ -1117,6 +1283,22 @@ impl SessionState {
                 );
             }
             None => {}
+        }
+        // Chỗ hay hụt nhất của cả cơ chế: máy có điện lại nhưng dừng ở màn hình
+        // khoá thì mục tự khởi động không nổ. Chỉ Windows mới có sẵn hộp thoại
+        // bật đăng nhập tự động, nên nút này chỉ hiện ở đó.
+        if self.tu_khoi_dong && cfg!(target_os = "windows") {
+            let nut = ui.small_button("Bật đăng nhập tự động…").on_hover_text(
+                "Mở hộp thoại tài khoản của Windows. Bỏ dấu ở dòng \"Người dùng phải \
+                     nhập tên và mật khẩu\", rồi gõ mật khẩu Windows của bạn vào đó — \
+                     phần mềm này không nhìn thấy mật khẩu ấy. Có nó thì máy mất điện bật \
+                     lại là vào thẳng màn hình làm việc, không dừng ở màn hình khoá.",
+            );
+            if nut.clicked()
+                && let Err(err) = crate::os::mo_dang_nhap_tu_dong()
+            {
+                self.loi_tu_khoi_dong = Some(err);
+            }
         }
     }
 

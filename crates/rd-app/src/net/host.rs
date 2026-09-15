@@ -55,8 +55,14 @@ const STALL_LIMIT: Duration = Duration::from_secs(5);
 /// nhập vừa đổi kịp ổn định.
 const RESTART_DELAY: Duration = Duration::from_secs(1);
 
-/// Dựng lại quá số lần này mà vẫn không có hình thì báo hẳn ra thay vì thử mãi.
-const MAX_RESTARTS: u32 = 5;
+/// Nghỉ dài nhất giữa hai lần dựng lại.
+///
+/// Có trần vì hỏng lâu không có nghĩa là hỏng vĩnh viễn: máy vừa có điện lại
+/// còn đang dựng màn hình, người dùng còn đang ở màn hình khoá, card đồ hoạ
+/// vừa khởi động lại — tất cả đều tự hết. Bỏ cuộc hẳn là người ở xa ngồi nhìn
+/// một tấm hình chết cho tới khi có ai đó ngồi vào máy, đúng thứ mà chế độ tự
+/// chia sẻ sinh ra để tránh.
+const RESTART_MAX: Duration = Duration::from_secs(10);
 
 /// Câu báo sai mật khẩu. Cả bên viewer cũng dò chuỗi này để biết có nên thử
 /// lại hay không, nên đổi chữ ở đây thì phải đổi cả `viewer::fatal`.
@@ -783,22 +789,17 @@ async fn start_encoder(
     // đường truyền chịu được, chứ không quay về mức khởi điểm.
     let mut bitrate_kbps = start_kbps;
     let events = ctx.events.clone();
-    // Chỉ số → id mà tầng capture hiểu. Danh sách rỗng (không hỏi được màn
-    // hình) thì cứ để capture tự chọn màn hình mặc định.
-    let display_count = displays.len().max(1) as u32;
-    let display_id = move |index: u32| {
-        displays
-            .get(index as usize)
-            .map(|d: &rd_capture::DisplayInfo| d.id)
-            .unwrap_or(0)
-    };
+    // Luồng mã hoá giữ bản danh sách của mình vì nó *hỏi lại* mỗi khi dựng lại
+    // chuỗi: id màn hình không cố định qua một lần card đồ hoạ khởi động lại.
+    let mut displays = displays;
+    let mut display_count = displays.len().max(1) as u32;
     let mut current = monitor.load(Ordering::Relaxed);
 
     std::thread::Builder::new()
         .name("rd-encode".into())
         .spawn(move || {
-            let mut source = match EncodeSource::start(
-                display_id(current),
+            let source = match EncodeSource::start(
+                id_man_hinh(&displays, current),
                 target_fps,
                 bitrate_kbps,
                 allow_10bit,
@@ -819,92 +820,128 @@ async fn start_encoder(
             let mut last_restart = std::time::Instant::now();
             let mut first_frame = true;
             let mut last_frame = std::time::Instant::now();
+            // Có lúc không có chuỗi chụp: quãng giữa hai lần dựng lại. Phiên
+            // vẫn sống trong quãng ấy — chuột phím, chat, tệp đều chạy tiếp.
+            let mut source = Some(source);
+            // Màn hình đang xem trước khi người dùng đổi, để quay về nếu màn
+            // hình mới mở không được.
+            let mut man_hinh_cu: Option<u32> = None;
             loop {
-                if keyframe.swap(false, Ordering::Relaxed) {
-                    source.request_keyframe();
-                }
-                let kbps = bitrate.swap(0, Ordering::Relaxed);
-                if kbps > 0 {
-                    bitrate_kbps = kbps;
-                    if let Err(err) = source.set_bitrate(kbps) {
-                        tracing::warn!(%err, kbps, "không đổi được bitrate");
+                let Some(src) = source.as_mut() else {
+                    // Nghỉ trước đã: dựng lại tức thì thì hỏng lại tức thì, mà
+                    // vòng hỏng-dựng liên tục đốt CPU của chính máy đang chia
+                    // sẻ — người xem thấy hình giật chứ không thấy hình về.
+                    std::thread::sleep(cho_dung_lai(restarts));
+                    if frame_tx.is_closed() {
+                        break;
                     }
-                }
-
-                // Đổi màn hình cũng là dựng lại cả chuỗi, chỉ khác lý do:
-                // phân giải mới, bộ mã hoá mới, nên không có đường nào nhẹ hơn.
-                let want = monitor.load(Ordering::Relaxed);
-                if want != current && want < display_count {
-                    let truoc = current;
-                    current = want;
-                    events.status(format!("đang chuyển sang màn hình {}", want + 1));
-                    source.stop();
-                    drop(source);
+                    // Hỏi lại danh sách màn hình trước khi dựng. Card đồ hoạ
+                    // khởi động lại, màn hình vừa bật, hay máy vừa lên sau khi
+                    // mất điện đều đổi id màn hình; giữ id cũ thì mọi lần dựng
+                    // lại đều trỏ vào một màn hình không còn ai nhận, và hình
+                    // sẽ không bao giờ về.
+                    let moi = list_displays();
+                    if !moi.is_empty() {
+                        displays = moi;
+                        display_count = displays.len().max(1) as u32;
+                        if current >= display_count {
+                            current = 0;
+                            monitor.store(current, Ordering::Relaxed);
+                        }
+                    }
                     match EncodeSource::start(
-                        display_id(current),
+                        id_man_hinh(&displays, current),
                         target_fps,
                         bitrate_kbps,
                         allow_10bit,
                         &viewer_codecs,
                     ) {
-                        Ok(fresh) => {
-                            source = fresh;
+                        Ok(mut fresh) => {
+                            // Người xem đang giữ một tấm hình chết; chuỗi mới
+                            // phải mở đầu bằng keyframe thì hình mới sống lại.
+                            fresh.request_keyframe();
+                            source = Some(fresh);
                             errors = 0;
                             first_frame = true;
                             last_frame = std::time::Instant::now();
-                            source.request_keyframe();
-                            continue;
+                            last_restart = std::time::Instant::now();
+                            man_hinh_cu = None;
                         }
                         Err(err) => {
-                            // Màn hình mới mở không được thì quay về màn hình cũ:
-                            // thà xem nhầm màn hình còn hơn mất luôn hình.
-                            events.status(format!("không mở được màn hình đó: {err}"));
-                            current = truoc;
-                            monitor.store(truoc, Ordering::Relaxed);
-                            match EncodeSource::start(
-                                display_id(current),
-                                target_fps,
-                                bitrate_kbps,
-                                allow_10bit,
-                                &viewer_codecs,
-                            ) {
-                                Ok(fresh) => {
-                                    source = fresh;
-                                    first_frame = true;
-                                    last_frame = std::time::Instant::now();
-                                    source.request_keyframe();
-                                    continue;
-                                }
-                                Err(err) => {
-                                    events.status(format!("mất luôn màn hình cũ: {err}"));
-                                    return;
-                                }
+                            restarts += 1;
+                            // Vừa đổi màn hình mà mở không được thì quay về màn
+                            // hình cũ: thà xem nhầm màn hình còn hơn mất hình.
+                            if let Some(truoc) = man_hinh_cu.take() {
+                                current = truoc;
+                                monitor.store(truoc, Ordering::Relaxed);
                             }
+                            events.status(format!(
+                                "chưa mở lại được màn hình (lần {restarts}): {err}"
+                            ));
+                            tracing::warn!(%err, restarts, "dựng lại chuỗi chụp hỏng");
                         }
                     }
-                } else if want != current {
+                    continue;
+                };
+
+                if keyframe.swap(false, Ordering::Relaxed) {
+                    src.request_keyframe();
+                }
+                let kbps = bitrate.swap(0, Ordering::Relaxed);
+                if kbps > 0 {
+                    bitrate_kbps = kbps;
+                    if let Err(err) = src.set_bitrate(kbps) {
+                        tracing::warn!(%err, kbps, "không đổi được bitrate");
+                    }
+                }
+
+                // Đổi màn hình cũng là dựng lại cả chuỗi, chỉ khác lý do: phân
+                // giải mới, bộ mã hoá mới, nên không có đường nào nhẹ hơn.
+                let want = monitor.load(Ordering::Relaxed);
+                if want != current {
+                    if want < display_count {
+                        events.status(format!("đang chuyển sang màn hình {}", want + 1));
+                        man_hinh_cu = Some(current);
+                        current = want;
+                        // Đây là người dùng bấm chứ không phải hỏng: dựng lại
+                        // ngay, đừng bắt chờ theo nhịp giãn của lần hỏng trước.
+                        restarts = 0;
+                        src.stop();
+                        source = None;
+                        continue;
+                    }
                     // Viewer xin màn hình không tồn tại (vừa rút cáp chẳng hạn).
                     monitor.store(current, Ordering::Relaxed);
                 }
 
                 // Lý do phải dựng lại cả chuỗi, nếu có.
-                let broken = match source.next_encoded(Duration::from_millis(500)) {
+                let broken = match src.next_encoded(Duration::from_millis(500)) {
                     Ok(Some(frame)) => {
                         errors = 0;
                         last_frame = std::time::Instant::now();
-                        // Chạy êm đủ lâu thì xoá tiền án: hạn 5 lần dựng lại là
-                        // để chặn vòng lặp hỏng-dựng-hỏng trong vài giây, chứ
-                        // một phiên cả ngày thì 5 lần rải rác là bình thường.
+                        // Chạy êm đủ lâu thì xoá tiền án: nhịp nghỉ giãn dần là
+                        // để chặn vòng hỏng-dựng-hỏng trong vài giây, chứ một
+                        // phiên cả ngày thì vài lần dựng lại rải rác là thường.
                         if restarts > 0 && last_restart.elapsed() >= HEALTHY_STREAK {
                             restarts = 0;
                         }
                         if first_frame {
                             first_frame = false;
-                            let info = source.info();
+                            let info = src.info();
                             events.status(format!(
                                 "đang gửi hình {}x{} {:?}",
                                 info.width, info.height, info.codec
                             ));
+                            // Mã hoá bằng phần mềm ăn CPU gấp nhiều lần và hình
+                            // giật thấy rõ. Hay gặp nhất là lúc máy vừa khởi
+                            // động: bộ mã hoá của card chưa sẵn sàng. Ghi lại để
+                            // còn đối chiếu khi người dùng kêu giật.
+                            if !info.hardware {
+                                tracing::warn!(
+                                    codec = ?info.codec,
+                                    "đang mã hoá bằng phần mềm, không phải bằng card đồ hoạ"
+                                );
+                            }
                         }
                         // Bỏ frame khi hàng đầy thay vì chờ: chờ ở đây là để
                         // frame *sau* già đi theo, mà nó mới là frame đáng gửi.
@@ -936,43 +973,17 @@ async fn start_encoder(
                 // phục được, và phiên vẫn đang sống — chuột phím bên kia vẫn
                 // chạy, chỉ mỗi hình là mất.
                 restarts += 1;
-                if restarts > MAX_RESTARTS {
-                    events.status(format!("dừng chụp màn hình: {reason}"));
-                    break;
-                }
                 events.status(format!("mất hình ({reason}), đang dựng lại…"));
-                // Thả hẳn chuỗi cũ *trước khi* dựng chuỗi mới. Gán đè
-                // `source = fresh` là thả sau, và như thế thì hai bản sao màn
-                // hình cùng tồn tại một lúc — DXGI chỉ cho một bản mỗi tiến
-                // trình nên bản mới hỏng ngay từ đầu.
-                source.stop();
-                drop(source);
-                std::thread::sleep(RESTART_DELAY);
-                match EncodeSource::start(
-                    display_id(current),
-                    target_fps,
-                    bitrate_kbps,
-                    allow_10bit,
-                    &viewer_codecs,
-                ) {
-                    Ok(fresh) => {
-                        source = fresh;
-                        errors = 0;
-                        first_frame = true;
-                        last_frame = std::time::Instant::now();
-                        last_restart = std::time::Instant::now();
-                        // Người xem đang giữ một tấm hình chết; chuỗi mới phải
-                        // mở đầu bằng keyframe thì hình mới sống lại được.
-                        source.request_keyframe();
-                    }
-                    Err(err) => {
-                        events.status(format!("không dựng lại được chuỗi chụp: {err}"));
-                        // Chuỗi cũ đã thả ở trên rồi, không còn gì để dọn.
-                        return;
-                    }
-                }
+                tracing::warn!(reason, restarts, "chuỗi chụp tắc, dựng lại");
+                // Thả hẳn chuỗi cũ *trước khi* dựng chuỗi mới. Giữ cả hai một
+                // lúc là hỏng: DXGI chỉ cho một bản sao màn hình mỗi tiến trình,
+                // nên bản mới sẽ hỏng ngay từ đầu.
+                src.stop();
+                source = None;
             }
-            source.stop();
+            if let Some(mut src) = source {
+                src.stop();
+            }
         })
         .context("không tạo được luồng mã hoá")?;
 
@@ -1101,6 +1112,25 @@ fn spawn_injector(
         .expect("tạo được luồng bơm input");
 
     tx
+}
+
+/// Chỉ số trong danh sách → id mà tầng capture hiểu. Ngoài tầm thì trả 0, tức
+/// là "để capture tự chọn màn hình mặc định".
+fn id_man_hinh(displays: &[rd_capture::DisplayInfo], index: u32) -> u32 {
+    displays.get(index as usize).map(|d| d.id).unwrap_or(0)
+}
+
+/// Nghỉ bao lâu trước lần dựng lại thứ `lan`.
+///
+/// Lần đầu thử ngay: phần lớn cú chết là nhất thời (khoá máy, đổi độ phân
+/// giải) và dựng lại là xong. Hỏng thêm thì giãn dần, vì hỏng thêm nghĩa là
+/// máy đang bận với thứ gì đó lâu hơn — vừa khởi động, hay card đồ hoạ đang
+/// dựng lại driver.
+fn cho_dung_lai(lan: u32) -> Duration {
+    if lan == 0 {
+        return Duration::ZERO;
+    }
+    (RESTART_DELAY * 2u32.saturating_pow((lan - 1).min(4))).min(RESTART_MAX)
 }
 
 /// Danh sách màn hình của máy này, hoặc một mục giả nếu không hỏi được.
@@ -1256,6 +1286,15 @@ mod auth_gate_tests {
         let sau = now + AUTH_FORGET + Duration::from_secs(1);
         assert!(gate.con_phai_cho(ip(1), sau).is_zero());
         assert!(gate.fails.is_empty());
+    }
+
+    #[test]
+    fn cho_dung_lai_tang_dan_roi_dung_o_tran() {
+        assert_eq!(cho_dung_lai(0), Duration::ZERO);
+        assert_eq!(cho_dung_lai(1), RESTART_DELAY);
+        assert_eq!(cho_dung_lai(2), RESTART_DELAY * 2);
+        assert_eq!(cho_dung_lai(3), RESTART_DELAY * 4);
+        assert_eq!(cho_dung_lai(9), RESTART_MAX);
     }
 
     #[test]

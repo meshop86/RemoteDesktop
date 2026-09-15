@@ -7,7 +7,7 @@
 # Visual Studio.
 #
 # Cần cài trước, mỗi máy một lần:
-#     brew install llvm lld
+#     brew install llvm lld makensis
 #     cargo install cargo-xwin
 #     rustup target add x86_64-pc-windows-msvc
 #
@@ -42,3 +42,27 @@ rm -f "$zip"
 
 echo "xong: $zip"
 shasum -a 256 "$zip"
+
+# Bộ cài mới là thứ nên đưa cho người dùng: gói .zip hay bị mở thẳng trong
+# Explorer, chương trình chạy từ %TEMP% và mất tăm sau lần khởi động sau, nên
+# mọi thứ dựa vào đường dẫn cố định (tự mở lại khi có điện) đều gãy.
+if command -v makensis >/dev/null; then
+    setup="$root/dist/RemoteDesktop-$version-windows-bo-cai.exe"
+    rm -f "$setup"
+    # Kèm bộ cài Tailscale chính thức, tải một lần rồi giữ trong cache.
+    ts_msi="$HOME/Library/Caches/rd-tailscale/tailscale-setup-amd64.msi"
+    if [ ! -f "$ts_msi" ]; then
+        mkdir -p "$(dirname "$ts_msi")"
+        curl -fL -o "$ts_msi" https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi
+    fi
+    makensis -V2 \
+        -DTAILSCALE_MSI="$ts_msi" \
+        -DVERSION="$version" \
+        -DSRC="$out" \
+        -DOUT="$setup" \
+        "$root/packaging/windows/installer.nsi"
+    echo "xong: $setup"
+    shasum -a 256 "$setup"
+else
+    echo "bỏ qua bộ cài — chưa có makensis (brew install makensis)" >&2
+fi

@@ -551,18 +551,7 @@ const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 pub fn autostart_value() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        let out = std::process::Command::new("reg")
-            .args(["query", RUN_KEY, "/v", AUTOSTART_NAME])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        // Dòng cần tìm: "    RemoteDesktop    REG_SZ    "C:\...\rd.exe" --background"
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .find_map(|line| line.split("REG_SZ").nth(1))
-            .map(|value| value.trim().to_string())
+        lenh_cua_task().or_else(gia_tri_khoa_run)
     }
     #[cfg(not(target_os = "windows"))]
     std::fs::read_to_string(launch_agent()?).ok()
@@ -660,6 +649,7 @@ fn kiem_tu_khoi_dong() -> bool {
             for dong in value.lines().filter(|dong| !dong.trim().is_empty()) {
                 println!("      {}", dong.trim());
             }
+            println!("      đường đăng ký: {}", cach_tu_khoi_dong());
             println!(
                 "      (trạng thái ban đầu: {})",
                 if truoc {
@@ -685,19 +675,14 @@ fn kiem_tu_khoi_dong() -> bool {
 fn khoi_phuc_tu_khoi_dong(cu: &str) {
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("reg")
-            .args([
-                "add",
-                RUN_KEY,
-                "/v",
-                AUTOSTART_NAME,
-                "/t",
-                "REG_SZ",
-                "/d",
-                cu,
-                "/f",
-            ])
-            .output();
+        // Chép nguyên chuỗi vào khoá Run là biến việc đã hẹn của người ta
+        // thành một mục khoá Run — yếu hơn hẳn. Tách lấy đường dẫn rồi đăng ký
+        // lại đúng đường cũ.
+        let duong = duong_trong_lenh(cu);
+        let duong = Path::new(duong);
+        if dat_task(duong).is_err() {
+            let _ = dat_khoa_run(Some(duong));
+        }
     }
     #[cfg(not(target_os = "windows"))]
     if let Some(path) = launch_agent() {
@@ -735,10 +720,7 @@ fn kiem_chay_ngam() -> bool {
 pub fn autostart_enabled() -> bool {
     #[cfg(target_os = "windows")]
     {
-        let out = std::process::Command::new("reg")
-            .args(["query", RUN_KEY, "/v", AUTOSTART_NAME])
-            .output();
-        matches!(out, Ok(out) if out.status.success())
+        co_task() || co_khoa_run()
     }
     #[cfg(not(target_os = "windows"))]
     launch_agent().map(|path| path.exists()).unwrap_or(false)
@@ -761,11 +743,16 @@ fn cho_khong_ben(exe: &Path) -> Option<String> {
         ));
     }
     if duong.contains("/Temp/") || duong.contains("/tmp/") {
-        return Some(
+        return Some(if cfg!(target_os = "windows") {
+            "phần mềm đang chạy từ thư mục tạm — đây là dấu hiệu file .zip được mở thẳng \
+             trong Explorer chứ chưa giải nén. Chạy bộ cài (bản …-bo-cai.exe) rồi mở phần \
+             mềm từ Start menu."
+                .to_string()
+        } else {
             "phần mềm đang chạy từ thư mục tạm (mở thẳng trong file .zip). Giải nén ra một \
              thư mục cố định rồi chạy từ đó."
-                .to_string(),
-        );
+                .to_string()
+        });
     }
     if o_dia_chi_doc(exe) {
         return Some(format!(
@@ -817,6 +804,316 @@ pub fn canh_bao_tu_khoi_dong() -> Option<String> {
     })
 }
 
+/// Mô tả công việc đã hẹn của Windows, dạng XML mà `schtasks` nhận.
+///
+/// Vì sao phải XML mà không gọi `schtasks /sc onlogon` cho gọn: mặc định của
+/// Windows có hai điều giết đúng thứ ta cần. Một, việc bị dừng sau ba ngày
+/// chạy — máy chia sẻ để quên vài hôm là im. Hai, máy đang chạy pin thì việc
+/// không được khởi động — laptop rút điện ra là thôi luôn. Cả hai chỉ đổi được
+/// qua XML.
+///
+/// Chạy cho cả nhóm Users (S-1-5-32-545) chứ không riêng người cài: máy có
+/// điện lại, ai đăng nhập vào cũng dựng được phiên chia sẻ.
+#[cfg(any(target_os = "windows", test))]
+fn task_xml(exe: &Path) -> String {
+    let lenh = xml_an_toan(&exe.display().to_string());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Mở Remote Desktop ở chế độ chia sẻ ngay khi đăng nhập, để máy mất điện bật lại vẫn nối vào được.</Description>
+    <URI>\{AUTOSTART_NAME}</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <GroupId>S-1-5-32-545</GroupId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{lenh}</Command>
+      <Arguments>--background</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#
+    )
+}
+
+/// Thay những ký tự XML không cho phép nằm trần trong nội dung thẻ.
+#[cfg(any(target_os = "windows", test))]
+fn xml_an_toan(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Ghi tệp XML theo UTF-16 kèm BOM — `schtasks` chỉ chịu đọc kiểu ấy.
+/// Cho phép Explorer thả tệp vào cửa sổ của ta.
+///
+/// Chạy bằng quyền quản trị — việc đã hẹn lúc khởi động máy dựng phần mềm lên
+/// đúng như vậy — thì Windows chặn thông điệp từ tiến trình quyền thấp hơn gửi
+/// sang. Explorer là tiến trình thường, nên kéo tệp sang chỉ thấy con trỏ cấm
+/// mà không hiểu vì sao. Ba thông điệp dưới đây là đường đi của một cú thả
+/// tệp; mở cho chúng qua là thả được như thường. Máy chạy quyền thường thì lời
+/// gọi này chẳng đổi gì.
+pub fn cho_phep_tha_tep() {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{ChangeWindowMessageFilter, MSGFLT_ADD};
+
+        const WM_DROPFILES: u32 = 0x0233;
+        const WM_COPYDATA: u32 = 0x004A;
+        /// Không có tên trong SDK: thông điệp nội bộ chở khối dữ liệu kèm theo.
+        const WM_COPYGLOBALDATA: u32 = 0x0049;
+
+        for thong_diep in [WM_DROPFILES, WM_COPYDATA, WM_COPYGLOBALDATA] {
+            if let Err(err) = unsafe { ChangeWindowMessageFilter(thong_diep, MSGFLT_ADD) } {
+                tracing::warn!(thong_diep, %err, "không mở được bộ lọc cho việc thả tệp");
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn ghi_utf16(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut byte = vec![0xFF, 0xFE];
+    for don_vi in text.encode_utf16() {
+        byte.extend_from_slice(&don_vi.to_le_bytes());
+    }
+    std::fs::write(path, byte)
+}
+
+/// Đăng ký công việc đã hẹn. Trả `Err` kèm lời của `schtasks` khi không xong —
+/// hay gặp nhất là chưa có quyền quản trị.
+#[cfg(target_os = "windows")]
+fn dat_task(exe: &Path) -> Result<(), String> {
+    let xml = std::env::temp_dir().join("remote-desktop-task.xml");
+    ghi_utf16(&xml, &task_xml(exe)).map_err(|err| format!("không ghi được mô tả việc: {err}"))?;
+    let mut command = std::process::Command::new("schtasks");
+    command.args(["/create", "/tn", AUTOSTART_NAME, "/xml"]);
+    command.arg(&xml);
+    command.arg("/f");
+    crate::tailscale::hide_console(&mut command);
+    let out = command
+        .output()
+        .map_err(|err| format!("không gọi được schtasks: {err}"))?;
+    let _ = std::fs::remove_file(&xml);
+    if out.status.success() {
+        return Ok(());
+    }
+    let loi = String::from_utf8_lossy(&out.stderr);
+    let loi = loi.trim();
+    Err(if loi.is_empty() {
+        "schtasks không tạo được việc đã hẹn".to_string()
+    } else {
+        loi.to_string()
+    })
+}
+
+/// Gỡ công việc đã hẹn. Không có sẵn thì cũng coi như xong.
+#[cfg(target_os = "windows")]
+fn xoa_task() {
+    let mut command = std::process::Command::new("schtasks");
+    command.args(["/delete", "/tn", AUTOSTART_NAME, "/f"]);
+    crate::tailscale::hide_console(&mut command);
+    let _ = command.output();
+}
+
+/// Khoá Run còn mục của ta không. Đây là đường lui khi không đăng ký được
+/// việc đã hẹn (thiếu quyền quản trị) — vẫn tự mở sau khi đăng nhập, chỉ là
+/// thiếu mấy tính chất bền của việc đã hẹn.
+#[cfg(target_os = "windows")]
+fn co_khoa_run() -> bool {
+    let mut command = std::process::Command::new("reg");
+    command.args(["query", RUN_KEY, "/v", AUTOSTART_NAME]);
+    crate::tailscale::hide_console(&mut command);
+    matches!(command.output(), Ok(out) if out.status.success())
+}
+
+/// Đọc giá trị đang nằm ở khoá Run.
+#[cfg(target_os = "windows")]
+fn gia_tri_khoa_run() -> Option<String> {
+    let mut command = std::process::Command::new("reg");
+    command.args(["query", RUN_KEY, "/v", AUTOSTART_NAME]);
+    crate::tailscale::hide_console(&mut command);
+    let out = command.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // Dòng cần tìm: "    RemoteDesktop    REG_SZ    "C:\...\rd.exe" --background"
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.split("REG_SZ").nth(1))
+        .map(|value| value.trim().to_string())
+}
+
+/// Ghi hoặc xoá mục ở khoá Run.
+#[cfg(target_os = "windows")]
+fn dat_khoa_run(exe: Option<&Path>) -> Result<(), String> {
+    let mut command = std::process::Command::new("reg");
+    match exe {
+        // `--background` để nó vào thẳng chế độ chia sẻ với mật khẩu đã lưu,
+        // cửa sổ thu nhỏ sẵn — không ai ngồi trước máy để bấm.
+        Some(exe) => command.args([
+            "add",
+            RUN_KEY,
+            "/v",
+            AUTOSTART_NAME,
+            "/t",
+            "REG_SZ",
+            "/d",
+            &autostart_command(exe),
+            "/f",
+        ]),
+        None => command.args(["delete", RUN_KEY, "/v", AUTOSTART_NAME, "/f"]),
+    };
+    crate::tailscale::hide_console(&mut command);
+    let out = command
+        .output()
+        .map_err(|err| format!("không gọi được reg: {err}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Đường dẫn mà việc đã hẹn đang trỏ tới, đọc ngược từ XML nó giữ.
+#[cfg(target_os = "windows")]
+fn lenh_cua_task() -> Option<String> {
+    let mut command = std::process::Command::new("schtasks");
+    command.args(["/query", "/tn", AUTOSTART_NAME, "/xml", "ONE"]);
+    crate::tailscale::hide_console(&mut command);
+    let out = command.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let xml = doc_ra_chu(&out.stdout);
+    let lenh = giua(&xml, "<Command>", "</Command>")?.trim();
+    let tham_so = giua(&xml, "<Arguments>", "</Arguments>")
+        .unwrap_or_default()
+        .trim();
+    // Cùng một dạng chuỗi với khoá Run, để chỗ đọc khỏi phải phân biệt hai
+    // đường đăng ký: `"C:\...\rd.exe" --background`.
+    Some(format!("\"{lenh}\" {tham_so}").trim().to_string())
+}
+
+/// Giải mã thứ `schtasks` in ra. Bản `/xml` in UTF-16, các lệnh khác in một
+/// byte một ký tự — nhận ra nhau qua BOM hoặc byte 0 xen kẽ.
+#[cfg(target_os = "windows")]
+fn doc_ra_chu(byte: &[u8]) -> String {
+    let co_bom = byte.starts_with(&[0xFF, 0xFE]);
+    if !co_bom && !byte.iter().skip(1).step_by(2).any(|&b| b == 0) {
+        return String::from_utf8_lossy(byte).into_owned();
+    }
+    let than = if co_bom { &byte[2..] } else { byte };
+    let don_vi: Vec<u16> = than
+        .chunks_exact(2)
+        .map(|cap| u16::from_le_bytes([cap[0], cap[1]]))
+        .collect();
+    String::from_utf16_lossy(&don_vi)
+}
+
+/// Lấy đoạn nằm giữa hai mốc. Đủ dùng cho một thẻ XML đơn, khỏi kéo thư viện.
+#[cfg(any(target_os = "windows", test))]
+fn giua<'a>(text: &'a str, mo: &str, dong: &str) -> Option<&'a str> {
+    let sau = text.split_once(mo)?.1;
+    Some(sau.split_once(dong)?.0)
+}
+
+/// Công việc đã hẹn có tồn tại không.
+#[cfg(target_os = "windows")]
+fn co_task() -> bool {
+    let mut command = std::process::Command::new("schtasks");
+    command.args(["/query", "/tn", AUTOSTART_NAME]);
+    crate::tailscale::hide_console(&mut command);
+    matches!(command.output(), Ok(out) if out.status.success())
+}
+
+/// Tách đường dẫn ra khỏi chuỗi dạng `"C:\...\rd.exe" --background`.
+#[cfg(any(target_os = "windows", test))]
+fn duong_trong_lenh(lenh: &str) -> &str {
+    let lenh = lenh.trim().trim_start_matches('"');
+    match lenh.split_once("\" ") {
+        Some((duong, _)) => duong,
+        None => lenh.trim_end_matches('"'),
+    }
+}
+
+/// Đang đăng ký tự khởi động bằng đường nào, nói bằng tiếng người. Dùng cho
+/// phần tự kiểm: hai đường không giống nhau về độ bền, nên phải biết đang là
+/// đường nào.
+pub fn cach_tu_khoi_dong() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        if co_task() {
+            "việc đã hẹn của Windows (bền, chạy được cả khi chưa có bộ cài)"
+        } else if co_khoa_run() {
+            "khoá Run (đường lui khi thiếu quyền quản trị)"
+        } else {
+            "chưa đăng ký"
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if autostart_enabled() {
+            "LaunchAgent của macOS"
+        } else {
+            "chưa đăng ký"
+        }
+    }
+}
+
+/// Mở hộp thoại tài khoản người dùng của Windows (`netplwiz`).
+///
+/// Vì sao cần: việc đã hẹn chỉ nổ khi có người đăng nhập. Máy mất điện bật lại
+/// mà dừng ở màn hình khoá thì chẳng có gì chạy cả. Bật đăng nhập tự động ở
+/// hộp thoại này là cách của chính Windows để qua chỗ ấy.
+///
+/// Mật khẩu do người dùng gõ thẳng vào hộp thoại của Windows. Phần mềm này chỉ
+/// mở hộp thoại ra, không đọc, không lưu, không gửi đi đâu.
+pub fn mo_dang_nhap_tu_dong() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("netplwiz")
+            .spawn()
+            .map(|_| ())
+            .map_err(|err| format!("không mở được hộp thoại tài khoản: {err}"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    Err("chỉ Windows mới có hộp thoại này".to_string())
+}
+
 /// Bật/tắt tự khởi động. Trả lỗi dưới dạng câu tiếng Việt để hiện thẳng lên
 /// giao diện.
 pub fn set_autostart(on: bool) -> Result<(), String> {
@@ -828,31 +1125,23 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        let mut command = std::process::Command::new("reg");
-        if on {
-            // `--background` để nó vào thẳng chế độ chia sẻ với mật khẩu đã
-            // lưu, cửa sổ thu nhỏ sẵn — không ai ngồi trước máy để bấm.
-            command.args([
-                "add",
-                RUN_KEY,
-                "/v",
-                AUTOSTART_NAME,
-                "/t",
-                "REG_SZ",
-                "/d",
-                &autostart_command(&exe),
-                "/f",
-            ]);
-        } else {
-            command.args(["delete", RUN_KEY, "/v", AUTOSTART_NAME, "/f"]);
+        if !on {
+            // Gỡ cả hai đường, không cần biết đang đăng ký bằng đường nào.
+            xoa_task();
+            let _ = dat_khoa_run(None);
+            return Ok(());
         }
-        let out = command
-            .output()
-            .map_err(|err| format!("không gọi được reg: {err}"))?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        match dat_task(&exe) {
+            Ok(()) => {
+                // Đã có việc đã hẹn thì bỏ mục ở khoá Run đi, kẻo máy mở lên
+                // chạy hai bản cùng lúc, tranh nhau cổng.
+                let _ = dat_khoa_run(None);
+                Ok(())
+            }
+            // Không đăng ký được việc đã hẹn thì gần như luôn vì chưa có quyền
+            // quản trị. Khoá Run không cần quyền ấy, nên vẫn còn đường lui.
+            Err(vi_task) => dat_khoa_run(Some(&exe))
+                .map_err(|vi_run| format!("{vi_task}; khoá Run cũng không ghi được: {vi_run}")),
         }
     }
 
@@ -1009,6 +1298,47 @@ mod tests {
             lenh,
             r#""C:\Program Files\Remote Desktop\rd.exe" --background"#
         );
+    }
+
+    /// Bốn tính chất phải có trong mô tả việc đã hẹn, mỗi cái đều từng là một
+    /// lần máy không lên: chạy đúng bản đã cài, vào thẳng chế độ ngầm, không bị
+    /// giết sau ba ngày, và máy chạy pin vẫn khởi động.
+    #[test]
+    fn mo_ta_viec_da_hen_du_bon_tinh_chat() {
+        let xml = task_xml(Path::new(r"C:\Program Files\Remote Desktop\rd.exe"));
+        assert_eq!(
+            giua(&xml, "<Command>", "</Command>"),
+            Some(r"C:\Program Files\Remote Desktop\rd.exe")
+        );
+        assert_eq!(
+            giua(&xml, "<Arguments>", "</Arguments>"),
+            Some("--background")
+        );
+        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
+    }
+
+    /// Tên thư mục có dấu `&` mà không thoát thì XML hỏng, `schtasks` từ chối,
+    /// và người dùng chỉ thấy ô tự khởi động im lặng không chịu bật.
+    #[test]
+    fn duong_dan_co_ky_tu_xml_thi_duoc_thoat() {
+        let xml = task_xml(Path::new(r"C:\Tools\R&D <beta>\rd.exe"));
+        assert_eq!(
+            giua(&xml, "<Command>", "</Command>"),
+            Some(r"C:\Tools\R&amp;D &lt;beta&gt;\rd.exe")
+        );
+    }
+
+    /// Lúc tự kiểm phải trả lại đúng mục cũ. Đọc nhầm đường dẫn là ghi đè mục
+    /// tự khởi động của người ta bằng một đường dẫn cụt.
+    #[test]
+    fn tach_duoc_duong_dan_ra_khoi_lenh() {
+        assert_eq!(
+            duong_trong_lenh(r#""C:\Program Files\Remote Desktop\rd.exe" --background"#),
+            r"C:\Program Files\Remote Desktop\rd.exe"
+        );
+        assert_eq!(duong_trong_lenh(r#""C:\rd.exe""#), r"C:\rd.exe");
+        assert_eq!(duong_trong_lenh("C:/rd.exe"), "C:/rd.exe");
     }
 
     #[test]
